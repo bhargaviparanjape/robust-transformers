@@ -88,6 +88,11 @@ _import_structure = {
         "DefaultDataCollator",
         "default_data_collator",
     ],
+    "data.data_collator_cartography": [
+        "CartographyDataCollator",
+        "cartography_data_collator",
+        "CartographyDataCollatorWithPadding",
+    ],
     "data.metrics": [],
     "data.processors": [],
     "debug_utils": [],
@@ -1646,6 +1651,8 @@ if is_torch_available():
     _import_structure["trainer"] = ["Trainer"]
     _import_structure["trainer_pt_utils"] = ["torch_distributed_zero_first"]
     _import_structure["trainer_seq2seq"] = ["Seq2SeqTrainer"]
+    _import_structure["trainer_dro"] = ["TrainerDro"]
+    _import_structure["dro_loss"] = ["LossComputer", "DroArguments"]
 else:
     from .utils import dummy_pt_objects
 
@@ -2406,6 +2413,11 @@ if TYPE_CHECKING:
         DataCollatorWithPadding,
         DefaultDataCollator,
         default_data_collator,
+    )
+    from .data.data_collator_cartography import (
+        cartography_data_collator,
+        CartographyDataCollator,
+        CartographyDataCollatorWithPadding
     )
     from .feature_extraction_sequence_utils import SequenceFeatureExtractor
 
@@ -3719,6 +3731,8 @@ if TYPE_CHECKING:
         from .trainer import Trainer
         from .trainer_pt_utils import torch_distributed_zero_first
         from .trainer_seq2seq import Seq2SeqTrainer
+        from .trainer_dro import TrainerDro
+        from .dro_loss import LossComputer, DroArguments
     else:
         from .utils.dummy_pt_objects import *
 

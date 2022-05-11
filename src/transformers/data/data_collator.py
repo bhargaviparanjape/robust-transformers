@@ -128,7 +128,6 @@ def torch_default_data_collator(features: List[InputDataClass]) -> Dict[str, Any
                 batch[k] = torch.stack([f[k] for f in features])
             else:
                 batch[k] = torch.tensor([f[k] for f in features])
-
     return batch
 
 

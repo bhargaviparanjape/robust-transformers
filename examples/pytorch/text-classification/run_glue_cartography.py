@@ -27,18 +27,20 @@ import datasets
 import numpy as np
 from datasets import load_dataset, load_metric
 
+import torch
 import transformers
 from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    DataCollatorWithPadding,
+    CartographyDataCollatorWithPadding,
     EvalPrediction,
     HfArgumentParser,
     PretrainedConfig,
-    Trainer,
+    TrainerDro,
     TrainingArguments,
-    default_data_collator,
+    DroArguments,
+    cartography_data_collator,
     set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
@@ -63,6 +65,14 @@ task_to_keys = {
     "wnli": ("sentence1", "sentence2"),
 }
 
+custom_task_to_keys = {
+    "mnli_resplit": ("sentence1", "sentence2"),
+    "wilds_civil_comments": ("sentence1", None),
+    "winogrande": ("sentence1", "sentence2"),
+    "commonsenseqa": ("sentence1", "sentence2"),
+}
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,6 +88,10 @@ class DataTrainingArguments:
 
     task_name: Optional[str] = field(
         default=None,
+        metadata={"help": "The name of the task to train on: " + ", ".join(task_to_keys.keys())},
+    )
+    custom_task_name: Optional[str] = field(
+        default="mnli_resplit",
         metadata={"help": "The name of the task to train on: " + ", ".join(task_to_keys.keys())},
     )
     dataset_name: Optional[str] = field(
@@ -143,7 +157,7 @@ class DataTrainingArguments:
             raise ValueError("Need either a GLUE task, a training/validation file or a dataset name.")
         else:
             train_extension = self.train_file.split(".")[-1]
-            assert train_extension in ["csv", "json"], "`train_file` should be a csv or a json file."
+            assert train_extension in ["tsv", "csv", "json"], "`train_file` should be a csv or a json file."
             validation_extension = self.validation_file.split(".")[-1]
             assert (
                 validation_extension == train_extension
@@ -191,13 +205,15 @@ def main():
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, DroArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args, dro_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        model_args, data_args, training_args, dro_args = parser.parse_args_into_dataclasses()
+
+    
 
     # Setup logging
     logging.basicConfig(
@@ -349,7 +365,10 @@ def main():
                 sentence1_key, sentence2_key = non_label_column_names[:2]
             else:
                 sentence1_key, sentence2_key = non_label_column_names[0], None
-        sentence1_key, sentence2_key = "text", None
+        # TODO:For amazon, sentence1_key is fixed as "text"
+        # sentence1_key, sentence2_key = "text", None
+        # Custom MNLI with group info
+        sentence1_key, sentence2_key = custom_task_to_keys[data_args.custom_task_name]
 
     # Padding strategy
     if data_args.pad_to_max_length:
@@ -402,6 +421,9 @@ def main():
         # Map labels to IDs (not necessary for GLUE tasks)
         if label_to_id is not None and "label" in examples:
             result["label"] = [(label_to_id[l] if l != -1 else -1) for l in examples["label"]]
+        
+        result["guid"] = examples["guid"]
+        result["group"] = examples["group"]
         return result
 
     with training_args.main_process_first(desc="dataset map pre-processing"):
@@ -461,16 +483,34 @@ def main():
     # Data collator will default to DataCollatorWithPadding when the tokenizer is passed to Trainer, so we change it if
     # we already did the padding.
     if data_args.pad_to_max_length:
-        data_collator = default_data_collator
+        data_collator = cartography_data_collator
     elif training_args.fp16:
-        data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
+        data_collator = CartographyDataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
     else:
         data_collator = None
 
+    # Group DRO: Update trainin args with group counts, num_groups and group_str.
+    #TODO: change datasets.arrow_dataset.
+    if dro_args.is_robust and training_args.do_train:
+        group_list = [ex["group"] for ex in train_dataset]
+        unique_groups, group_counts = np.unique(group_list, return_counts=True)
+        dro_args.n_groups = len(unique_groups)
+        dro_args.group_counts = torch.LongTensor(group_counts)
+        #dro_args.group_str = 
+    
+    if dro_args.reweight_groups and training_args.do_train:
+        # For ERM models, you need group_counts for weighted sampling.
+        group_list = [ex["group"] for ex in train_dataset]
+        unique_groups, group_counts = np.unique(group_list, return_counts=True)
+        dro_args.n_groups = len(unique_groups)
+        dro_args.group_counts = torch.LongTensor(group_counts)
+
+
     # Initialize our Trainer
-    trainer = Trainer(
+    trainer = TrainerDro(
         model=model,
         args=training_args,
+        dro_args=dro_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
         compute_metrics=compute_metrics,

@@ -27,6 +27,11 @@ from .data_collator import (
     DefaultDataCollator,
     default_data_collator,
 )
+from .data_collator_cartography import (
+    cartography_data_collator,
+    CartographyDataCollator,
+    CartographyDataCollatorWithPadding
+)
 from .metrics import glue_compute_metrics, xnli_compute_metrics
 from .processors import (
     DataProcessor,
