@@ -498,6 +498,13 @@ def main():
         dro_args.group_counts = torch.LongTensor(group_counts)
         #dro_args.group_str = 
     
+    if dro_args.is_robust and dro_args.use_group_weights:
+        group_distributions = np.asarray([ex["group_distribution"] for ex in train_dataset])
+        group_list = np.argmax(group_distributions, axis=1)
+        unique_groups, group_counts = np.unique(group_list, return_counts=True)
+        dro_args.n_groups = len(unique_groups)
+        dro_args.group_counts = torch.LongTensor(group_counts)
+    
     if dro_args.reweight_groups and training_args.do_train:
         # For ERM models, you need group_counts for weighted sampling.
         group_list = [ex["group"] for ex in train_dataset]

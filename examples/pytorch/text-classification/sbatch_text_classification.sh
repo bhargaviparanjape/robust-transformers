@@ -17,10 +17,12 @@ conda activate work
 python run_glue_cartography.py \
     --model_name_or_path roberta-base \
     --custom_task_name mnli_resplit \
-    --train_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/synthetic/train.json \
-    --validation_file  /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/synthetic/dev.json \
-    --test_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/synthetic/dev.json \
+    --train_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/train_sample_slicing.json \
+    --validation_file  /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/train_sample_slicing.json \
+    --test_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/train_sample_slicing.json \
     --save_total_limit 2 \
+    --max_train_samples 512 \
+    --max_eval_samples 512 \
     --do_train \
     --do_eval \
     --do_predict \
@@ -28,7 +30,11 @@ python run_glue_cartography.py \
     --per_device_train_batch_size 32 \
     --learning_rate 2e-5 \
     --num_train_epochs 3 \
-    --output_dir  /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_erm_roberta_bz32_epoch3_synthetic \
+    --output_dir  /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_erm_sample \
     --overwrite_cache --overwrite_output_dir \
     --cache_dir /gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/cache_ \
-
+    --is_robust \
+    --reweight_groups \
+    --logging_steps 5 \
+    --robust_algorithm GDRO \
+    --use_group_weights
