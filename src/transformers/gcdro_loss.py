@@ -11,18 +11,23 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Un
 class GCDROLossComputer:
     def __init__(self, dro_args, training_args, n_groups, group_counts, adj=None):
         self.is_robust = dro_args.is_robust
-        self.gamma = dro_args.gamma
-        self.alpha = dro_args.alpha
+        self.gamma = dro_args.gamma # ema for group loss 
+        self.alpha = dro_args.alpha # alpha-cover factor
         self.min_var_weight = dro_args.min_var_weight
         self.step_size = dro_args.step_size
         self.normalize_loss = dro_args.normalize_loss
         self.btl = dro_args.btl
         self.training_args = training_args
 
+        self.beta = dro_args.beta
+        self.beta_ema = dro_args.beta_ema
+        self.do_instance_reweight = dro_args.do_instance_reweight
+
         ## Can we pass these arguments, after computing upon reading the data, and then passing it through training args to Trainer.
         self.n_groups = n_groups
-        self.group_counts = self._prepare_input(group_counts) #TODO: Shifting to device should be handled carefully.
-        self.group_frac = self.group_counts/self.group_counts.sum()
+        self.group_counts = self._prepare_input(group_counts)
+        self.count_cat = self._prepare_input(torch.ones(self.n_groups).float())
+        #self.group_frac = self.group_counts/self.group_counts.sum()
         #self.group_str = group_str
 
         if adj is not None:
@@ -34,9 +39,13 @@ class GCDROLossComputer:
             assert dro_args.alpha, 'alpha must be specified'
 
         # quantities maintained throughout training
-        self.adv_probs = self._prepare_input(torch.ones(self.n_groups))/self.n_groups
+        self.adv_probs = self._prepare_input(torch.ones(self.n_groups)) #/self.n_groups
         self.exp_avg_loss = self._prepare_input(torch.zeros(self.n_groups))
+        self.group_loss = self._prepare_input(torch.zeros(self.n_groups))
         self.exp_avg_initialized = self._prepare_input(torch.zeros(self.n_groups).byte())
+
+        # quantities maintained throughout training for instance level G-DRO
+        self.accum_losses = None
 
         self.reset_stats()
 
@@ -58,9 +67,18 @@ class GCDROLossComputer:
             return data.to(**kwargs)
         return data
 
-    def loss(self, per_sample_losses, yhat, y, group_idx=None, is_training=False):
+    def loss(self, per_sample_losses, yhat, y, group_idx=None, group_distribution=None, instance_weights=None, is_training=False):
         # compute per-sample and per-group losses
         # per_sample_losses = self.criterion(yhat, y) #TODO: Change, per_sample_loss is already computed.
+
+        """
+        GC-DRO loss specifics
+        if "weights" in sample:
+            ind_loss = ind_loss * sample["weights"]
+        """
+        if instance_weights is not None and self.do_instance_reweight:
+            per_sample_losses = instance_weights*per_sample_losses
+
         group_loss, group_count = self.compute_group_avg(per_sample_losses, group_idx)
         group_acc, group_count = self.compute_group_avg((torch.argmax(yhat,1)==y).float(), group_idx)
 
@@ -68,32 +86,13 @@ class GCDROLossComputer:
         self.update_exp_avg_loss(group_loss, group_count)
 
         # compute overall loss
-        if self.is_robust and not self.btl:
-            actual_loss, weights = self.compute_robust_loss(group_loss, group_count)
-        elif self.is_robust and self.btl:
-            actual_loss, weights = self.compute_robust_loss_btl(group_loss, group_count)
-        else:
-            actual_loss = per_sample_losses.mean()
-            weights = None
-
+        actual_loss, weights = self.compute_robust_loss_btl(group_loss, group_count)
+        #import pdb; pdb.set_trace()
+        
         # update stats
         self.update_stats(actual_loss, group_loss, group_acc, group_count, weights)
 
         return actual_loss
-
-    def compute_robust_loss(self, group_loss, group_count):
-        adjusted_loss = group_loss
-        if torch.all(self.adj>0):
-            adjusted_loss += self.adj/torch.sqrt(self.group_counts)
-        if self.normalize_loss:
-            adjusted_loss = adjusted_loss/(adjusted_loss.sum())
-        self.adv_probs = self.adv_probs * torch.exp(self.step_size*adjusted_loss.data)
-        self.adv_probs = self.adv_probs/(self.adv_probs.sum())
-
-        # adv_probs is a multiplier i.e. the more a particular group is weighed, the more that group's 
-        # loss is optimized i.e. the more that group participates in optimization.
-        robust_loss = group_loss @ self.adv_probs 
-        return robust_loss, self.adv_probs
 
     def compute_robust_loss_btl(self, group_loss, group_count):
         adjusted_loss = self.exp_avg_loss + self.adj/torch.sqrt(self.group_counts)
@@ -101,21 +100,39 @@ class GCDROLossComputer:
 
     def compute_robust_loss_greedy(self, group_loss, ref_loss):
         sorted_idx = ref_loss.sort(descending=True)[1]
-        sorted_loss = group_loss[sorted_idx]
-        sorted_frac = self.group_frac[sorted_idx]
+        #sorted_loss = group_loss[sorted_idx]
+        past_frac = self.count_cat / self.count_cat.sum() 
+        sorted_frac = past_frac[sorted_idx]
 
+        """
         mask = torch.cumsum(sorted_frac, dim=0)<=self.alpha
-        weights = mask.float() * sorted_frac /self.alpha
+        self.adv_probs = mask.float() * sorted_frac /self.alpha
         last_idx = mask.sum()
-        weights[last_idx] = 1 - weights.sum()
-        weights = sorted_frac*self.min_var_weight + weights*(1-self.min_var_weight)
+        self.adv_probs[last_idx] = 1 - self.adv_probs.sum()
+        self.adv_probs = sorted_frac*self.min_var_weight + self.adv_probs*(1-self.min_var_weight)
+        """
 
-        robust_loss = sorted_loss @ weights
+        ## Chunting's code verison of greedy alpha-cover upweighting.
+        cutoff_count = torch.sum(torch.cumsum(sorted_frac, 0) < self.alpha)
+        if cutoff_count == len(sorted_frac):
+            cutoff_count = len(sorted_frac) - 1
+        self.adv_probs=  self.adv_probs.new_full(self.adv_probs.size(), self.min_var_weight)
+        self.adv_probs[sorted_idx[:cutoff_count]] = 1.0 / self.alpha
+        leftover_mass = 1.0 - sorted_frac[:cutoff_count].sum().div(self.alpha)
+        tiebreak_fraction = leftover_mass / sorted_frac[cutoff_count]  # check!
+        self.adv_probs[sorted_idx[cutoff_count]] = tiebreak_fraction
+
+        robust_loss = group_loss @ self.adv_probs
 
         # sort the weights back
-        _, unsort_idx = sorted_idx.sort()
-        unsorted_weights = weights[unsort_idx]
-        return robust_loss, unsorted_weights
+        # _, unsort_idx = sorted_idx.sort()
+        # unsorted_weights = weights[unsort_idx]
+
+        # update class objects for logging in trainer_dro
+        self.group_loss = group_loss
+        #self.adv_probs = weights
+
+        return robust_loss, self.adv_probs
 
     def compute_group_avg(self, losses, group_idx):
         # compute observed counts and mean loss for each group
@@ -126,12 +143,17 @@ class GCDROLossComputer:
         return group_loss, group_count
 
     def update_exp_avg_loss(self, group_loss, group_count):
+        ## TODO: Chunting's code is doing a different kind of exponential averaging, exp_avf_initialized not used.
         prev_weights = (1 - self.gamma*(group_count>0).float()) * (self.exp_avg_initialized>0).float()
         curr_weights = 1 - prev_weights
         self.exp_avg_loss = self.exp_avg_loss * prev_weights + group_loss*curr_weights
+
+        ## TODO: Chunting's code is also doing an exponential averaging of counts (with alpha 0.05)
+        self.count_cat = self.count_cat.mul(1 - 0.05).add(group_count, alpha=0.05)
+        
         self.exp_avg_initialized = (self.exp_avg_initialized>0) + (group_count>0)
 
-    def reset_stats(self):
+    def reset_stats(self):        
         self.processed_data_counts = self._prepare_input(torch.zeros(self.n_groups))
         self.update_data_counts = self._prepare_input(torch.zeros(self.n_groups))
         self.update_batch_counts = self._prepare_input(torch.zeros(self.n_groups))
@@ -141,6 +163,11 @@ class GCDROLossComputer:
         self.avg_actual_loss = 0.
         self.avg_acc = 0.
         self.batch_count = 0.
+        
+        #TODO: Chunting also sets weights to 1 here, and self.exp_avg_loss to 0
+        self.exp_avg_loss.fill_(0.)
+        self.adv_probs.fill_(1.)
+        
 
     def update_stats(self, actual_loss, group_loss, group_acc, group_count, weights=None):
         # avg group loss
@@ -218,3 +245,26 @@ class GCDROLossComputer:
                 f'adv prob = {self.adv_probs[group_idx]:3f}   '
                 f'acc = {self.avg_group_acc[group_idx]:.3f}\n')
         # logger.flush()
+
+    def compute_beta_cover(self, seed, epoch, dataset, losses=None):
+        split_array = np.array([item["group"] for item in dataset])
+        total = len(split_array)
+        if losses is not None:
+            if self.accum_losses is None:
+                self.accum_losses = losses
+            else:
+                self.accum_losses = self.accum_losses * (1 - self.beta_ema) + losses * self.beta_ema
+        
+            for gidx in range(self.n_groups):
+                select_idx = np.where(split_array == gidx)[0]
+                count = len(select_idx)
+                idx_sorted = np.argsort(self.accum_losses[select_idx])
+                idx = select_idx[idx_sorted][::-1]
+                cutoff_count = int((total - count) * count * self.beta / (total - count * self.beta))
+                self.weight_array[idx] = count / total
+                self.weight_array[idx[:cutoff_count]] = 1.0 / self.beta
+        else:
+            self.weight_array = np.ones(total)
+        return self.weight_array
+
+

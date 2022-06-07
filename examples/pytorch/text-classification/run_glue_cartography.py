@@ -43,6 +43,7 @@ from transformers import (
     cartography_data_collator,
     set_seed,
 )
+from transformers.file_utils import WEIGHTS_NAME
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
@@ -70,6 +71,10 @@ custom_task_to_keys = {
     "wilds_civil_comments": ("sentence1", None),
     "winogrande": ("sentence1", "sentence2"),
     "commonsenseqa": ("sentence1", "sentence2"),
+    "wanli": ("premise", "hypothesis"),
+    "qqp": ("question1", "question2"),
+    "sst2": ("sentence", None),
+    "fever": ("sentence1", "sentence2"),
 }
 
 
@@ -549,6 +554,29 @@ def main():
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
 
+        # At the end of training, the best model is loaded for evaluation. In case of evaluation called without training, this needs to be done explicitly.
+        if trainer.state.best_model_checkpoint is not None:
+            # Wait for everyone to get here so we are sur the model has been saved by process 0.
+            # if is_torch_tpu_available():
+            #     xm.rendezvous("load_best_model_at_end")
+            # elif args.local_rank != -1:
+            #     dist.barrier()
+            logger.info(
+                f"Loading best model from {trainer.state.best_model_checkpoint} (score: {trainer.state.best_metric})."
+            )
+
+            best_model_path = os.path.join(trainer.state.best_model_checkpoint, WEIGHTS_NAME)
+            if os.path.exists(best_model_path):
+                # We load the model state dict on the CPU to avoid an OOM error.
+                state_dict = torch.load(best_model_path, map_location="cpu")
+                # If the model is on the GPU, it still works!
+                trainer._load_state_dict_in_model(state_dict)
+            else:
+                logger.warning(
+                    f"Could not locate the best model at {best_model_path}, if you are running a distributed training "
+                    "on multiple nodes, you should activate `--save_on_each_node`."
+                )
+
         # Loop to handle MNLI double evaluation (matched, mis-matched)
         tasks = [data_args.task_name]
         eval_datasets = [eval_dataset]
@@ -569,6 +597,28 @@ def main():
 
     if training_args.do_predict:
         logger.info("*** Predict ***")
+
+        if trainer.state.best_model_checkpoint is not None:
+            # Wait for everyone to get here so we are sur the model has been saved by process 0.
+            # if is_torch_tpu_available():
+            #     xm.rendezvous("load_best_model_at_end")
+            # elif args.local_rank != -1:
+            #     dist.barrier()
+            logger.info(
+                f"Loading best model from {trainer.state.best_model_checkpoint} (score: {trainer.state.best_metric})."
+            )
+
+            best_model_path = os.path.join(trainer.state.best_model_checkpoint, WEIGHTS_NAME)
+            if os.path.exists(best_model_path):
+                # We load the model state dict on the CPU to avoid an OOM error.
+                state_dict = torch.load(best_model_path, map_location="cpu")
+                # If the model is on the GPU, it still works!
+                trainer._load_state_dict_in_model(state_dict)
+            else:
+                logger.warning(
+                    f"Could not locate the best model at {best_model_path}, if you are running a distributed training "
+                    "on multiple nodes, you should activate `--save_on_each_node`."
+                )
 
         # Loop to handle MNLI double evaluation (matched, mis-matched)
         tasks = [data_args.task_name]
@@ -601,11 +651,6 @@ def main():
         kwargs["dataset_tags"] = "glue"
         kwargs["dataset_args"] = data_args.task_name
         kwargs["dataset"] = f"GLUE {data_args.task_name.upper()}"
-
-    if training_args.push_to_hub:
-        trainer.push_to_hub(**kwargs)
-    else:
-        trainer.create_model_card(**kwargs)
 
 
 def _mp_fn(index):

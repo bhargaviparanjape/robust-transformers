@@ -14,9 +14,11 @@ class DroArguments:
     """
     is_robust: bool = field(default=False, metadata={"help": "Do Robust Optimization."})
     robust_algorithm: str = field(default="GDRO", metadata={"help": "Type of Robust Optimization Algorithm."})
-    gamma: float = field(default=0.1, metadata={"help": "Discount factor for exp. moving average of group losses."})
+    use_group_weights: bool = field(default=False, metadata={"help": "Use distributions over groups to compute group averages."})
+    selection_criterion: str = field(default="worst_accuracy", metadata={"help": "Model selection criterion on the dev set."})
+    gamma: float = field(default=0.5, metadata={"help": "Discount factor for exp. moving average of group losses."})
     alpha: float = field(default=0.2, metadata={"help": "Hyperparameter for Greedy DRO."})
-    min_var_weight: float = field(default=0, metadata={"help": "Hyperparameter for Greedy DRO."})
+    min_var_weight: float = field(default=0.1, metadata={"help": "Hyperparameter for Greedy DRO."})
     step_size: float = field(default=0.01, metadata={"help": "Hyperparameter for EG DRO."})
     normalize_loss: bool = field(default=False, metadata={"help": "Normalize group loss."})
     btl: bool = field(default=False, metadata={"help": "Turn on greedy DRO and EG DRO."})
@@ -32,6 +34,14 @@ class DroArguments:
     """
     cg_step_size: float = field(default=0.05, metadata={"help": "CG Inner step size for gradient computation."})
     cg_C: float = field(default=0, metadata={"help": "CG adjustment multiplier."})
+
+
+    """
+    Arguments for GC-DRO loss : C-Var (greedy DRO) with instance reweighting (Zhou et. al.)
+    """
+    do_instance_reweight: bool = field(default=False, metadata={"help": "Do Beta cover instance reweighting."})
+    beta: float = field(default=0.5, metadata={"help": "Beta cover."})
+    beta_ema: float = field(default=0.5, metadata={"help": "EMA loss averaging discount factor."})
 
 
 class LossComputer:
@@ -65,6 +75,9 @@ class LossComputer:
         self.group_loss = self._prepare_input(torch.zeros(self.n_groups))
         self.exp_avg_initialized = self._prepare_input(torch.zeros(self.n_groups).byte())
 
+        # Other custom toggles
+        self.use_group_weights = dro_args.use_group_weights
+
         self.reset_stats()
 
     def _prepare_input(self, data: Union[torch.Tensor, Any]) -> Union[torch.Tensor, Any]:
@@ -85,11 +98,11 @@ class LossComputer:
             return data.to(**kwargs)
         return data
 
-    def loss(self, per_sample_losses, yhat, y, group_idx=None, is_training=False):
+    def loss(self, per_sample_losses, yhat, y, group_idx=None, group_distribution=None, instance_weights=None, is_training=False):
         # compute per-sample and per-group losses
         # per_sample_losses = self.criterion(yhat, y) #TODO: Change, per_sample_loss is already computed.
-        group_loss, group_count = self.compute_group_avg(per_sample_losses, group_idx)
-        group_acc, group_count = self.compute_group_avg((torch.argmax(yhat,1)==y).float(), group_idx)
+        group_loss, group_count = self.compute_group_avg(per_sample_losses, group_idx, group_distribution)
+        group_acc, group_count = self.compute_group_avg((torch.argmax(yhat,1)==y).float(), group_idx, group_distribution)
 
         # update historical losses
         self.update_exp_avg_loss(group_loss, group_count)
@@ -145,12 +158,17 @@ class LossComputer:
         unsorted_weights = weights[unsort_idx]
         return robust_loss, unsorted_weights
 
-    def compute_group_avg(self, losses, group_idx):
+    def compute_group_avg(self, losses, group_idx, group_distribution=None):
         # compute observed counts and mean loss for each group
-        group_map = (group_idx == self._prepare_input(torch.arange(self.n_groups).unsqueeze(1).long())).float()
-        group_count = group_map.sum(1)
-        group_denom = group_count + (group_count==0).float() # avoid nans
-        group_loss = (group_map @ losses.view(-1))/group_denom
+        if self.use_group_weights:
+            group_count = group_distribution.sum(0)
+            group_denom = group_count + (group_count==0).float() # avoid nans
+            group_loss = (group_distribution.transpose(1, 0) @ losses.view(-1))/group_denom
+        else:
+            group_map = (group_idx == self._prepare_input(torch.arange(self.n_groups).unsqueeze(1).long())).float()
+            group_count = group_map.sum(1)
+            group_denom = group_count + (group_count==0).float() # avoid nans
+            group_loss = (group_map @ losses.view(-1))/group_denom
         return group_loss, group_count
 
     def update_exp_avg_loss(self, group_loss, group_count):

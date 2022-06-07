@@ -21,15 +21,18 @@ if __name__ == "__main__":
     slices =  np.stack(pd_df["domino_slices"].to_numpy())
 
     group_assignment = {}
+    group_distributions = {}
     for i in range(len(pd_df)):
         ## Usually analysis is done with group assignment only if value is above a threshold.
         slice = int(np.argmax(pd_df.iloc[i]["domino_slices"]))
         slice_val = np.max(pd_df.iloc[i]["domino_slices"])
-        if slice_val > 0.70:
-            chosen_slice = slice
-        else:
-            chosen_slice = -1
+        # if slice_val > 0.70:
+        #     chosen_slice = slice
+        # else:
+        #     chosen_slice = -1
+        chosen_slice = slice
         guid = pd_df.iloc[i]["guid"]
+        group_distributions[guid] = list(pd_df.iloc[i]["domino_slices"])
         group_assignment[guid] = chosen_slice
     
     print(Counter(group_assignment.values()))
@@ -43,9 +46,10 @@ if __name__ == "__main__":
             guid = ex["guid"]
             new_ex = ex
             if args.split_by_label:
-                new_ex["group"] = 3*((group_assignment[guid] + 1)) + label_to_id[ex["label"]]
+                new_ex["group"] = 3*((group_assignment[guid])) + label_to_id[ex["label"]]
             else:
-                new_ex["group"] = group_assignment[guid] + 1
+                new_ex["group"] = group_assignment[guid]
+            new_ex["group_distribution"] = group_distributions[guid]
             fout.write(json.dumps(new_ex) + "\n")
 
     # Adjust threshold so that more than X>group assignment is made. 

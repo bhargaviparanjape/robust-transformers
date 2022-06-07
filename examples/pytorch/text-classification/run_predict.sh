@@ -1,7 +1,7 @@
 #model=/mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/automatic_clustering/mnli_erm_rw_roberta_bz32_epoch3_slices24_devbased
-model=/mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_gdro_eg_roberta_bz32_epoch3_synthetic_stepsize_0.001
-train_dataset=NLI/MNLI/train_sample.json
-dataset=NLI/MNLI/dev_resplit.json
+model=/mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_erm_roberta_bz32_epochs10
+train_dataset=NLI/MNLI/dev_resplit_v3.json
+dataset=NLI/MNLI/dev_resplit_v3.json
 python run_glue_cartography.py \
     --model_name_or_path ${model} \
     --custom_task_name mnli_resplit \

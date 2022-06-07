@@ -28,6 +28,8 @@ import numpy as np
 from datasets import load_dataset, load_metric
 import meerkat as mk
 import pandas as pd
+from numpy import dot
+from numpy.linalg import norm
 
 import torch
 import transformers
@@ -62,7 +64,7 @@ task_to_keys = {
     "rte": ("sentence1", "sentence2"),
     "sst2": ("sentence", None),
     "stsb": ("sentence1", "sentence2"),
-    "wanli": ("premise", "hypothesis"),
+    "wnli": ("sentence1", "sentence2"),
 }
 
 
@@ -70,11 +72,7 @@ custom_task_to_keys = {
     "mnli_resplit": ("sentence1", "sentence2"),
     "wilds_civil_comments": ("sentence1", None),
     "winogrande": ("sentence", None),
-    "sst2": ("sentence", None),
-    "fever": ("sentence1", "sentence2"),
     "commonsenseqa": ("sentence1", "sentence2"),
-    "wanli": ("premise", "hypothesis"),
-    "qqp": ("question1", "question2"),
 }
 
 
@@ -150,6 +148,9 @@ class DataTrainingArguments:
     create_features: Optional[bool] = field(
         default=False, metadata={"help": "Create training and evaluation data features."}
     )
+    find_spurious_features: Optional[bool] = field(
+        default=False, metadata={"help": "Use differences between pretrained and finetuned model to find pretrained features."}
+    )
     cluster_dev_features: Optional[bool] = field(
         default=False, metadata={"help": "Cluster training and evaluation data features."}
     )
@@ -191,6 +192,9 @@ class ModelArguments:
     model_name_or_path: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
+    pretrained_model_name_or_path: str = field(
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
     config_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
     )
@@ -218,7 +222,7 @@ class ModelArguments:
     )
 
 
-def create_features(training_args, trainer, dataloader, model, config, split):
+def create_features(training_args, trainer, dataloader, model, config, split, is_pretraining=False):
     # eval_datalooader = trainer.g
     total_train_batch_size = training_args.train_batch_size * training_args.gradient_accumulation_steps * training_args.world_size
     num_examples = len(dataloader) # Number of batches.
@@ -229,9 +233,12 @@ def create_features(training_args, trainer, dataloader, model, config, split):
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
 
     train_representations = np.array([], dtype='float32').reshape(0,model.config.hidden_size)
+    mean_train_representations = np.array([], dtype='float32').reshape(0,model.config.hidden_size)
+    all_contextual_representations = []
     train_logits = np.array([], dtype='float32').reshape(0, config.num_labels)
     train_labels = np.array([], dtype='float32').reshape(0)
     train_guids = []
+    train_lengths = []
     train_groups = np.array([], dtype='float32').reshape(0)
     ## creat a meerkat table.
     for step, inputs in tqdm.tqdm(enumerate(dataloader)):
@@ -251,12 +258,58 @@ def create_features(training_args, trainer, dataloader, model, config, split):
                     del inputs["group_distribution"]
                 inputs["output_hidden_states"] = True
                 outputs = model(**inputs)
+
+                """
+                for batch_index, seq_length in enumerate(inputs["attention_mask"].sum(1)):
+                    stacked_output = torch.vstack([outputs["hidden_states"][i][batch_index, :, :].unsqueeze(0) for i in range(model.config.num_hidden_layers + 1)]).cpu().numpy()
+                    all_contextual_representations.append(stacked_output)
+                    train_lengths.append(seq_length)
+                """
+
                 last_hidden_layer = outputs["hidden_states"][-1]
                 classifier_representations = last_hidden_layer[:,0,:]
                 train_representations = np.concatenate((train_representations, nested_numpify(classifier_representations)), axis=0)
-                logits  = outputs[1]
+                logits = outputs[1]
                 train_logits = np.concatenate((train_logits, nested_numpify(logits)), axis=0)
-                # Record predicted class as well.
+                # Record predicted class as well.                
+
+    """
+    Dump a sample for isotropy measurements. 
+    Sample 2*N token positions where i!=j. N=10K
+    Compute cosine, dump to file.
+    Get baseline consine values
+    """
+    """
+    N = 5000
+    X = []
+    Y = []
+    for i in range(2*N):
+        # Generate a sample
+        train_id = np.random.randint(len(train_guids))
+        # Generate tok_id 
+        tok_id = np.random.randint(train_lengths[train_id].item())
+        X.append(all_contextual_representations[train_id][:, tok_id, :])
+        # Generate a sample
+        train_id = np.random.randint(len(train_guids))
+        # Generate tok_id 
+        tok_id = np.random.randint(train_lengths[train_id].item())
+        Y.append(all_contextual_representations[train_id][:, tok_id, :])
+
+    consine_similarities_all_layers = []
+    for x, y in zip(X,Y):
+        cos_sim_all_layers = []
+        for i in range(model.config.num_hidden_layers+1):
+            cos_sim_all_layers.append(dot(x[i], y[i])/(norm(x[i])*norm(y[i])))
+        consine_similarities_all_layers.append(cos_sim_all_layers)
+
+    dp = mk.DataPanel({
+    'cosines': np.asarray(consine_similarities_all_layers)})
+    pd_df = mk.DataPanel.to_pandas(dp)
+    if not is_pretraining:
+        pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "{0}_random_cosines.pkl".format(split)))
+    else:
+        pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "{0}_random_cosines_pretrained.pkl".format(split)))
+    """
 
     """
     Meerkat DataPanel <https://github.com/robustness-gym/meerkat>`_ with columns
@@ -267,15 +320,23 @@ def create_features(training_args, trainer, dataloader, model, config, split):
     'guid': train_guids, 
     'group': train_groups,
     'emb': train_representations,
+    # 'mean_pooled': mean_train_representations,
     'target': train_labels,
-    'pred_probs': train_logits
+    'pred_probs': train_logits,
+    # 'all_hidden_states': all_contextual_representations,
+    # 'sequence_lengths': train_lengths
     })
 
     pd_df = mk.DataPanel.to_pandas(dp)
     clustering_cache = os.path.join(training_args.output_dir, "clustering") 
     if not os.path.exists(clustering_cache):
         os.mkdir(clustering_cache)
-    pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "{0}.pkl".format(split)))
+    if not is_pretraining:
+        pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "{0}.pkl".format(split)))
+    else:
+        pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "{0}_pretrained.pkl".format(split)))
+
+    #return all_contextual_representations, train_lengths
 
 
 def main():
@@ -347,6 +408,15 @@ def main():
     )
     model = AutoModelForSequenceClassification.from_pretrained(
         model_args.model_name_or_path,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        config=config,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+    )
+
+    pretrained_model = AutoModelForSequenceClassification.from_pretrained(
+        model_args.pretrained_model_name_or_path,
         from_tf=bool(".ckpt" in model_args.model_name_or_path),
         config=config,
         cache_dir=model_args.cache_dir,
@@ -457,24 +527,42 @@ def main():
         )
 
         train_dataloader = trainer.get_train_dataloader()
-        create_features(training_args, trainer, train_dataloader, model, config, "train")
-
         eval_dataloader = trainer.get_eval_dataloader(eval_dataset)
+        create_features(training_args, trainer, train_dataloader, model, config, split="train")
         create_features(training_args, trainer, eval_dataloader, model, config, split="dev")
 
+        trainer = TrainerDro(
+        model=pretrained_model,
+        args=training_args,
+        dro_args=dro_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+
+        compute_metrics=compute_metrics,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        )
+        train_dataloader = trainer.get_train_dataloader()
+        eval_dataloader = trainer.get_eval_dataloader(eval_dataset)
+        create_features(training_args, trainer, train_dataloader, pretrained_model, config, split="train", is_pretraining=True)
+        create_features(training_args, trainer, eval_dataloader, pretrained_model, config, split="dev", is_pretraining=True)
 
     if data_args.cluster_dev_features:
-        #label_to_id = {"entailment":0, "neutral":1, "contradiction":2} (already defined, reuse for consistency)
         id_to_label = {v:k for k,v in label_to_id.items()}
-        # load features
         split = "dev"
         logger.info("***** Loading features for {0} dataset *****".format(split))
         pd_df = pd.read_pickle(os.path.join(training_args.output_dir, "clustering", "{0}.pkl".format(split)))
         logits = np.stack(pd_df["pred_probs"].to_numpy())
+        pd_df_pretrained = pd.read_pickle(os.path.join(training_args.output_dir, "clustering", "{0}_pretrained.pkl".format(split)))
+        # Reuse current domino object only cluster by both pretrained and finetuned representation? 
+        finetuned_emb = np.stack(pd_df["emb"].to_numpy())
+        pretrained_emb = np.stack(pd_df_pretrained["emb"].to_numpy())
+        concatenated_emb = np.concatenate((finetuned_emb, pretrained_emb), axis=1)
+        difference_emb = pretrained_emb - finetuned_emb
         dp = mk.DataPanel({
             'guid': pd_df["guid"].to_list(),
             'group': np.stack(pd_df["group"].to_numpy()),
-            'emb': np.stack(pd_df["emb"].to_numpy()),
+            'emb': concatenated_emb,
             'target': np.stack(pd_df["target"].to_numpy()),
             'pred_probs': np.asarray(torch.softmax(torch.tensor(logits), dim=-1))
         })
@@ -483,14 +571,14 @@ def main():
             data=dp, embeddings="emb", targets="target", pred_probs="pred_probs"
         )
         # Save the domino class as a pickle
-        pickle.dump(domino, open(os.path.join(training_args.output_dir, "clustering", "{0}_dominoclass_{1}_slices.pkl".format(split, data_args.n_slices)), "wb"))
+        pickle.dump(domino, open(os.path.join(training_args.output_dir, "clustering", "{0}_dominoclass_{1}_slices_pretrained.pkl".format(split, data_args.n_slices)), "wb"))
         dp["domino_slices"] = domino.transform(
             data=dp, embeddings="emb", targets="target", pred_probs="pred_probs"
         )
         # Save the domino object so that it be used to draw comparisons.
         pd_df = mk.DataPanel.to_pandas(dp)
         logger.info("***** Dumping group assingments for {0} to file *****".format(split))
-        pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "{0}_output_{1}_slices.pkl".format(split, data_args.n_slices)))
+        pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "{0}_output_{1}_slices_pretrained.pkl".format(split, data_args.n_slices)))
         logger.info("***** Dumping groups for exploration for {0} to file *****".format(split))
         data_dict = {}
         slices_dict = {i:[] for i in range(-1, data_args.n_slices)}
@@ -514,7 +602,7 @@ def main():
             # Only look at slices that are actually erroneous
             if not np.argmax(pd_df.iloc[i]["pred_probs"]) == pd_df.iloc[i]["target"]:
                 slices_dict[chosen_slice].append(ex)
-        with open(os.path.join(training_args.output_dir, "clustering", "{0}_analysis_{1}_slices.txt".format(split, data_args.n_slices)), "w") as fout:
+        with open(os.path.join(training_args.output_dir, "clustering", "{0}_analysis_{1}_slices_pretrained.txt".format(split, data_args.n_slices)), "w") as fout:
             # ignore all examples that were assigned slice -1
             for i in range(data_args.n_slices):
                 fout.write("Slice {0}\n".format(i))
@@ -534,113 +622,6 @@ def main():
                 fout.write("\n\n\n")
         for i in range(-1, data_args.n_slices):
             print(len(slices_dict[i]))
-
-
-        # repeat grouping on train set (for G-DRO)
-        '''
-        split = "train"
-        logger.info("***** Loading features for {0} dataset *****".format(split))
-        pd_df = pd.read_pickle(os.path.join(training_args.output_dir, "clustering", "{0}.pkl".format(split)))
-        logits = np.stack(pd_df["pred_probs"].to_numpy())
-        dp = mk.DataPanel({
-            'guid': pd_df["guid"].to_list(),
-            'group': np.stack(pd_df["group"].to_numpy()),
-            'emb': np.stack(pd_df["emb"].to_numpy()),
-            'target': np.stack(pd_df["target"].to_numpy()),
-            'pred_probs': np.asarray(torch.softmax(torch.tensor(logits), dim=-1))
-        })
-        dp["domino_slices"] = domino.transform(
-            data=dp, embeddings="emb", targets="target", pred_probs="pred_probs"
-        )
-        pd_df = mk.DataPanel.to_pandas(dp)
-        logger.info("***** Dumping group assingments for {0} to file *****".format(split))
-        pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "{0}_output_{1}_slices.pkl".format(split, data_args.n_slices)))
-        train_slices = np.stack(pd_df["domino_slices"].to_numpy())
-        '''
-
-    if data_args.cluster_train_features:
-        id_to_label = {v:k for k,v in label_to_id.items()}
-        # load features
-        split = "train"
-        logger.info("***** Loading features for {0} dataset *****".format(split))
-        pd_df = pd.read_pickle(os.path.join(training_args.output_dir, "clustering", "{0}.pkl".format(split)))
-        logits = np.stack(pd_df["pred_probs"].to_numpy())
-        ## Add different toggles 
-        """
-        a) Just X
-        b) X and y_pred
-        c) X_pre, X and y_pred
-        """
-        if data_args.include_ypred:
-            dp = mk.DataPanel({
-                'guid': pd_df["guid"].to_list(),
-                'group': np.stack(pd_df["group"].to_numpy()),
-                'emb': np.stack(pd_df["emb"].to_numpy()),
-                # Remove access to y, y_hat so only X is used for clustering. This is not as different from what was done in Zhou et. al.
-                # 'target': np.stack(pd_df["target"].to_numpy()),
-                'pred_probs': np.asarray(torch.softmax(torch.tensor(logits), dim=-1))
-            })
-        else:
-            dp = mk.DataPanel({
-                'guid': pd_df["guid"].to_list(),
-                'group': np.stack(pd_df["group"].to_numpy()),
-                'emb': np.stack(pd_df["emb"].to_numpy()),
-                # Remove access to y, y_hat so only X is used for clustering. This is not as different from what was done in Zhou et. al.
-                # 'target': np.stack(pd_df["target"].to_numpy()),
-                # 'pred_probs': np.asarray(torch.softmax(torch.tensor(logits), dim=-1))
-            })
-        domino = DominoSlicer(n_slices=data_args.n_slices, n_mixture_components=data_args.n_mixture_components, init_params=data_args.init_type, max_iter=200)
-        if data_args.include_ypred:
-            domino.fit(data=dp, embeddings="emb", targets=None, pred_probs="pred_probs")
-            dp["domino_slices"] = domino.transform(data=dp, embeddings="emb", targets=None, pred_probs="pred_probs")
-        else:
-            domino.fit(data=dp, embeddings="emb", targets=None, pred_probs=None) #, targets="target", pred_probs="pred_probs")
-            dp["domino_slices"] = domino.transform(data=dp, embeddings="emb", targets=None, pred_probs=None) #, targets="target", pred_probs="pred_probs")
-        pd_df = mk.DataPanel.to_pandas(dp)
-        logger.info("***** Dumping group assingments for {0} to file *****".format(split))
-        if data_args.include_ypred:
-            prediction_filename = "{0}_output_{1}_slices_Xonly_ypred.pkl".format(split, data_args.n_slices)
-        else:
-            prediction_filename = "{0}_output_{1}_slices_Xonly.pkl".format(split, data_args.n_slices)
-        pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", prediction_filename))
-        logger.info("***** Dumping groups for exploration for {0} to file *****".format(split))
-        data_dict = {}
-        slices_dict = {i:[] for i in range(-1, data_args.n_slices)}
-        for ex in raw_datasets["train"]:
-            data_dict[ex["guid"]] = ex
-        for i in range(len(pd_df)):
-            ## Usually analysis is done with group assignment only if value is above a threshold.
-            slice = int(np.argmax(pd_df.iloc[i]["domino_slices"]))
-            slice_val = np.max(pd_df.iloc[i]["domino_slices"])
-            if slice_val > 0.90:
-                chosen_slice = slice
-            else:
-                chosen_slice = -1
-            guid = pd_df.iloc[i]["guid"]
-            ex = data_dict[guid]
-            # ex["prediction"] = id_to_label[np.argmax(pd_df.iloc[i]["pred_probs"])]
-            # Only look at slices that are actually erroneous
-            #if not np.argmax(pd_df.iloc[i]["pred_probs"]) == pd_df.iloc[i]["target"]:
-            slices_dict[chosen_slice].append(ex)
-        with open(os.path.join(training_args.output_dir, "clustering", "{0}_analysis_{1}_slices.txt".format(split, data_args.n_slices)), "w") as fout:
-            # ignore all examples that were assigned slice -1
-            for i in range(data_args.n_slices):
-                fout.write("Slice {0}\n".format(i))
-                for j, ex in enumerate(slices_dict[i]):
-                    if data_args.custom_task_name == "mnli_resplit":
-                        fout.write(str(j+1) + "\nPremise:" + ex["sentence1"] + "\nHypothesis:" + ex["sentence2"] + "\nGold:" + ex["label"] +  "\n")
-                    else:
-                        fout.write(str(j+1) + "\Comment:" + ex["sentence1"] + "\nGold:" + ex["label"] +  "\n")
-                fout.write("\n\n\n")
-        for i in range(-1, data_args.n_slices):
-            print(len(slices_dict[i]))
-
-
-    # Run feature generation loop over validation data
-
-    # Run feature generation loop over testing data
-
-    # Convert features int meerkat format, then apply DOMINO slicer. 
 
 
 

@@ -55,7 +55,7 @@ import numpy as np
 import torch
 from packaging import version
 from torch import Tensor, nn
-from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler, BatchSampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data.sampler import WeightedRandomSampler
 
@@ -138,6 +138,7 @@ from .utils import logging
 
 from .dro_loss import LossComputer, DroArguments
 from .cgd_loss import CGDLossComputer
+from .gcdro_loss import GCDROLossComputer
 
 
 _is_torch_generator_available = False
@@ -418,15 +419,6 @@ class TrainerDro:
         # Will be set to True by `self._setup_loggers()` on first call to `self.log()`.
         self._loggers_initialized = False
 
-        # Create clone of distant repo and output directory if needed
-        if self.args.push_to_hub:
-            self.init_git_repo(at_init=True)
-            # In case of pull, we need to make sure every process has the latest.
-            if is_torch_tpu_available():
-                xm.rendezvous("init git repo")
-            elif args.local_rank != -1:
-                dist.barrier()
-
         if self.args.should_save:
             os.makedirs(self.args.output_dir, exist_ok=True)
 
@@ -519,6 +511,7 @@ class TrainerDro:
 
         # Create a DroLossClass object to maintain consistent information across epochs.
         self.dro_args = dro_args
+
         adjustments = [float(c) for c in dro_args.generalization_adjustment.split(',')]
         assert len(adjustments) in (1, dro_args.n_groups)
         if len(adjustments)==1:
@@ -550,7 +543,16 @@ class TrainerDro:
                     group_counts= dro_args.group_counts,
                     params = params,
                     adj=adjustments)
-            # Also initialize validation and testing loss computers.
+            elif dro_args.robust_algorithm == "GCDRO":
+                ## In order to do instance reweighting at the end of every epoch, Dataset object will have to be separately defined?
+                self.train_loss_computer = GCDROLossComputer(
+                    dro_args=dro_args,
+                    training_args=args,
+                    # dataset=dataset['train_data'], ## Why is this needed? to compute n_groups, group_counts which are passed as arguments now.
+                    n_groups=dro_args.n_groups,
+                    group_counts= dro_args.group_counts,
+                    adj=adjustments)
+                self._add_columns()
 
 
     def add_callback(self, callback):
@@ -608,6 +610,8 @@ class TrainerDro:
             self._signature_columns += ["label", "label_ids"]
             self._signature_columns += ["guid"]
             self._signature_columns += ["group"]
+            self._signature_columns += ["group_distribution"]
+            self._signature_columns += ["instance_weight"]
 
         ignored_columns = list(set(dataset.column_names) - set(self._signature_columns))
         if len(ignored_columns) > 0:
@@ -628,6 +632,54 @@ class TrainerDro:
             return dataset
         else:
             return dataset.remove_columns(ignored_columns)
+
+    def _add_columns(self):
+        seed = self.args.seed
+        epoch = 0
+        # Check if evaluating.
+        if self.train_dataset is not None:
+            instance_weights = self.train_loss_computer.compute_beta_cover(seed, epoch, self.train_dataset)
+            self.train_dataset = self.train_dataset.add_column("instance_weight", instance_weights)
+
+    def _update_columns(self, epoch):
+        # Iterate over training data to compute loss.
+        logger.info(f"---- Re-Weight at the begeinning of epoch {epoch} -----")
+        train_losses = None
+        dataset = self._remove_unused_columns(self.train_dataset, description="evaluation")
+        dataloader = DataLoader(
+                    dataset,
+                    sampler=SequentialSampler(dataset),
+                    batch_size=self.args.train_batch_size,
+                    collate_fn=self.data_collator,
+                    drop_last=False,
+                    num_workers=self.args.dataloader_num_workers,
+                    pin_memory=self.args.dataloader_pin_memory,
+                )
+        model = self._wrap_model(self.model, training=False)
+        model.eval()
+        for step, inputs in tqdm(enumerate(dataloader)):
+            inputs = self._prepare_inputs(inputs)
+            with torch.no_grad():
+                groups = inputs["group"]
+                group_distributions = inputs.get("group_distribution", None)
+                instance_weights = inputs.get("instance_weight", None)
+                del inputs["group"]
+                if group_distributions is not None:
+                    del inputs["group_distribution"]
+                if instance_weights is not None:
+                    del inputs["instance_weight"]
+                loss, _ = self.compute_loss(model, inputs, return_outputs=True)
+                if train_losses is None:
+                    train_losses = loss.detach().cpu().numpy()
+                else:
+                    train_losses = np.append(train_losses, loss.detach().cpu().numpy(), axis=0)
+        # Process losses to compute beta cover weights 
+        instance_weights = self.train_loss_computer.compute_beta_cover(self.args.seed, epoch, self.train_dataset, train_losses)
+        # Update "instance_weights of self.train_dataset in dataloader (in the middle of training)
+        # TODO: Check if the dataloader which is consistent, is actually using the updated weights. 
+        self.train_dataset = self.train_dataset.remove_columns("instance_weight")
+        self.train_dataset = self.train_dataset.add_column("instance_weight", instance_weights)
+
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if not has_length(self.train_dataset):
@@ -681,9 +733,12 @@ class TrainerDro:
             if self.args.world_size <= 1:
                 if _is_torch_generator_available:
                     if self.dro_args.reweight_groups:
-                        group_array = []
-                        for ex in self.train_dataset:
-                            group_array.append(ex["group"])
+                        # group_array = []
+                        if self.dro_args.use_group_weights:
+                            group_distributions = np.asarray([ex["group_distribution"] for ex in self.train_dataset])
+                            group_array = np.argmax(group_distributions, axis=1)
+                        else:
+                            group_array = [ex["group"] for ex in self.train_dataset]
                         group_weights = len(self.train_dataset)/self._prepare_input(self.dro_args.group_counts)
                         weights = group_weights[group_array]
                         return WeightedRandomSampler(weights, len(self.train_dataset), replacement=True)
@@ -1457,6 +1512,11 @@ class TrainerDro:
         group_assignment_list = []
         group_loss_list = []
 
+        # Book-keeping for model selection
+        worst_valid_acc = None
+        bad_counts = 0
+        resplit_train_epoch = 0
+
         for epoch in range(epochs_trained, num_train_epochs):
             if isinstance(train_dataloader, DataLoader) and isinstance(train_dataloader.sampler, DistributedSampler):
                 train_dataloader.sampler.set_epoch(epoch)
@@ -1601,8 +1661,8 @@ class TrainerDro:
                     self.state.epoch = epoch + (step + 1) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                    # Just log, dont evaluate.
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval, evaluate=False)
+                    # Just log, and save checkpoints, dont evaluate.
+                    _ = self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval, evaluate=False)
                     if self.dro_args.is_robust and self.state.global_step % self.args.logging_steps == 0:
                         self.train_loss_computer.log_stats(logger, True)
                         self.log(self.train_loss_computer.get_stats(model, args))
@@ -1610,7 +1670,8 @@ class TrainerDro:
                         epoch_list.append(epoch)
                         group_assignment_list.append(list(self.train_loss_computer.adv_probs.cpu().numpy()))
                         group_loss_list.append(list(self.train_loss_computer.group_loss.detach().cpu().numpy()))
-                        self.train_loss_computer.reset_stats()
+                        # there is a mismatch between Chunting's code where reset happens only after 1 epoch. 
+                        # self.train_loss_computer.reset_stats()
                         
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
@@ -1623,6 +1684,16 @@ class TrainerDro:
                 self.train_loss_computer.log_stats(logger, True)
                 self.log(self.train_loss_computer.get_stats(model, args))
                 self.train_loss_computer.reset_stats()
+
+                if self.dro_args.robust_algorithm == "GCDRO":
+                    self._update_columns(epoch=epoch) #, dataloader=epoch_iterator)
+                    # update epoch iterator, since instance weights are being changed in self.train_dataset
+                    train_dataloader = self.get_train_dataloader()
+                    if is_torch_tpu_available():
+                        parallel_loader = pl.ParallelLoader(train_dataloader, [args.device]).per_device_loader(args.device)
+                        epoch_iterator = parallel_loader
+                    else:
+                        epoch_iterator = train_dataloader
 
             if step < 0:
                 logger.warning(
@@ -1640,7 +1711,31 @@ class TrainerDro:
                               train_golds=list(train_golds))
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval, evaluate=True)
+            metrics = self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval, evaluate=True)
+
+            # Training stopping criterion
+            resplit_train_epoch += 1
+            valid_group_acc = [(int(key.lstrip("eval_group_accuracy_")), metrics[key]) for key in metrics.keys() if key.startswith("eval_group_accuracy")]
+            curr_worst_valid_acc = min([acc for _, acc in valid_group_acc])
+            sorted_by_group_id = sorted(valid_group_acc, key=lambda tup: tup[0])
+            group_acc = " ".join(["%d: %.3f" % (idx, acc if acc > 0 else -acc) for idx, acc in sorted_by_group_id])
+            become_better = (worst_valid_acc is not None and worst_valid_acc > worst_valid_acc) or worst_valid_acc is None
+            worst_valid_acc = curr_worst_valid_acc if worst_valid_acc is None else max(curr_worst_valid_acc, worst_valid_acc)
+            bad_counts = 0 if become_better else bad_counts + 1
+
+            logger.info("Valid group performance: {}".format(group_acc))
+            logger.info("Better worst valid = {}, bad counts = {}, worst acc = {}".format(become_better, bad_counts, curr_worst_valid_acc))
+            # Update metrics (best_worst_group)
+            metrics["eval_worst_accuracy"] = worst_valid_acc
+
+            # Inner update criterion for GCDRO (every epoch or when worst accuracy drops (conservative), Chunting is using every epoch) : SKIP
+
+            # Early stopping criterion : Worst group has no changed for patience number of validations. Chunting uses default patience of -1, so no early stopping: SKIP 
+
+            # Model selection (save checkpoint with best worst_accuracy as the "best_" checkpoint)
+            if become_better:
+                # First time worst_accuracy is computed, or worst accuracy improved.
+                self._save_checkpoint(model, trial, metrics=metrics, save_best=True)
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
                 if is_torch_tpu_available():
@@ -1763,6 +1858,8 @@ class TrainerDro:
         if self.control.should_save:
             self._save_checkpoint(model, trial, metrics=metrics)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+        
+        return metrics
 
     def _load_rng_state(self, checkpoint):
         # Load RNG states from `checkpoint`
@@ -1805,13 +1902,16 @@ class TrainerDro:
         if is_torch_tpu_available():
             xm.set_rng_state(checkpoint_rng_state["xla"])
 
-    def _save_checkpoint(self, model, trial, metrics=None):
+    def _save_checkpoint(self, model, trial, metrics=None, save_best=False):
         # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
         # want to save except FullyShardedDDP.
         # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
 
         # Save model checkpoint
-        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        if save_best:
+            checkpoint_folder = f"best_checkpoint"
+        else:
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
 
         if self.hp_search_backend is not None and trial is not None:
             if self.hp_search_backend == HPSearchBackend.OPTUNA:
@@ -1914,9 +2014,6 @@ class TrainerDro:
             torch.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
         else:
             torch.save(rng_states, os.path.join(output_dir, f"rng_state_{local_rank}.pth"))
-
-        if self.args.push_to_hub:
-            self._push_from_checkpoint(output_dir)
 
         # Maybe delete some older checkpoints.
         if self.args.should_save:
@@ -2145,13 +2242,21 @@ class TrainerDro:
 
         with self.autocast_smart_context_manager():
             groups = inputs["group"]
+            group_distributions = inputs.get("group_distribution", None)
+            instance_weights = inputs.get("instance_weight", None)
             del inputs["group"]
+            if group_distributions is not None:
+                del inputs["group_distribution"]
+            if instance_weights is not None:
+                del inputs["instance_weight"]  
             loss, outputs = self.compute_loss(model, inputs, return_outputs=True) #return outputs in addition to loss, to record logits.
             # loss on inividual elements of batch
             if self.dro_args.is_robust:
                 y = inputs["labels"]
                 yhat = outputs[1]
-                loss = self.train_loss_computer.loss(loss, yhat, y, groups, is_training=True)
+                if torch.isnan(loss).any():
+                    import pdb; pdb.set_trace()
+                loss = self.train_loss_computer.loss(loss, yhat, y, groups, group_distributions, instance_weights, is_training=True)
             else:
                 loss = loss.mean() # reduce the loss here.
 
@@ -2284,9 +2389,6 @@ class TrainerDro:
         elif self.args.should_save:
             self._save(output_dir)
 
-        # Push to the Hub when `save_model` is called by the user.
-        if self.args.push_to_hub and not _internal_call:
-            self.push_to_hub(commit_message="Model save")
 
     def _save_tpu(self, output_dir: Optional[str] = None):
         output_dir = output_dir if output_dir is not None else self.args.output_dir
@@ -2371,6 +2473,9 @@ class TrainerDro:
         checkpoints_sorted = [checkpoint[1] for checkpoint in checkpoints_sorted]
         # Make sure we don't delete the best model.
         if self.state.best_model_checkpoint is not None:
+            if "best" in self.state.best_model_checkpoint:
+                # no need to remove any checkpoint from list, since best checkpoint is being explicitly saved.
+                return checkpoints_sorted
             best_model_index = checkpoints_sorted.index(str(Path(self.state.best_model_checkpoint)))
             for i in range(best_model_index, len(checkpoints_sorted) - 2):
                 checkpoints_sorted[i], checkpoints_sorted[i + 1] = checkpoints_sorted[i + 1], checkpoints_sorted[i]
@@ -2439,10 +2544,18 @@ class TrainerDro:
 
         # Declare an evaluation loss computer object.
         if self.dro_args.is_robust:
-            group_list = [ex["group"] for ex in self.eval_dataset]
-            unique_groups, group_counts = np.unique(group_list, return_counts=True)
-            n_groups = len(unique_groups)
-            group_counts = torch.LongTensor(group_counts)
+            if not self.dro_args.use_group_weights:
+                group_list = [ex["group"] for ex in self.eval_dataset]
+                unique_groups, group_counts = np.unique(group_list, return_counts=True)
+                n_groups = len(unique_groups)
+                group_counts = torch.LongTensor(group_counts)
+            else:
+                group_distributions = np.asarray([ex["group_distribution"] for ex in self.eval_dataset])
+                group_list = np.argmax(group_distributions, axis=1)
+                unique_groups, group_counts = np.unique(group_list, return_counts=True)
+                n_groups = len(unique_groups)
+                group_counts = torch.LongTensor(group_counts)
+                
             self.val_loss_computer = LossComputer(
                 dro_args=self.dro_args,
                 training_args=self.args,
@@ -2723,6 +2836,12 @@ class TrainerDro:
         else:
             metrics = {}
 
+        # Compute Worst Group Metrics!
+        n_eval_groups = self.val_loss_computer.n_groups
+        key = "accuracy"
+        for group_idx in range(n_eval_groups):
+            metrics[f"group_{key}_{group_idx}"] = self.val_loss_computer.avg_group_acc[group_idx]
+
         # To be JSON-serializable, we need to remove numpy types or zero-d tensors
         metrics = denumpify_detensorize(metrics)
 
@@ -2856,13 +2975,21 @@ class TrainerDro:
                 if has_labels:
                     with self.autocast_smart_context_manager():
                         groups = inputs["group"]
+                        group_distributions = inputs.get("group_distribution", None)
+                        instance_weights = inputs.get("instance_weight", None)
                         del inputs["group"]
+                        if group_distributions is not None:
+                            del inputs["group_distribution"]
+                        if instance_weights is not None:
+                            del inputs["instance_weight"]
                         loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
                         # loss on inividual elements of batch
                         if self.dro_args.is_robust:
                             y = inputs["labels"]
                             yhat = outputs[1]
-                            loss = self.val_loss_computer.loss(loss, yhat, y, groups, is_training=True)
+                            if torch.isnan(loss).any():
+                                import pdb; pdb.set_trace()
+                            loss = self.val_loss_computer.loss(loss, yhat, y, groups, group_distributions, is_training=True)
                         else:
                             loss = loss.mean() # reduce the loss here.
                     loss = loss.mean().detach()
@@ -2877,6 +3004,10 @@ class TrainerDro:
                         #TODO: Remove non-tensorizable elements from inputs.
                         del inputs["guid"]
                         del inputs["group"]
+                        if self.dro_args.use_group_weights or "group_distribution" in inputs:
+                            del inputs["group_distribution"]
+                        if "instance_weight" in inputs:
+                            del inputs["instance_weight"]
                         outputs = model(**inputs)
                     if isinstance(outputs, dict):
                         logits = tuple(v for k, v in outputs.items() if k not in ignore_keys)
@@ -2913,323 +3044,3 @@ class TrainerDro:
         else:
             return 0
 
-    def init_git_repo(self, at_init: bool = False):
-        """
-        Initializes a git repo in `self.args.hub_model_id`.
-
-        Args:
-            at_init (`bool`, *optional*, defaults to `False`):
-                Whether this function is called before any training or not. If `self.args.overwrite_output_dir` is
-                `True` and `at_init` is `True`, the path to the repo (which is `self.args.output_dir`) might be wiped
-                out.
-        """
-        if not self.is_world_process_zero():
-            return
-        use_auth_token = True if self.args.hub_token is None else self.args.hub_token
-        if self.args.hub_model_id is None:
-            repo_name = Path(self.args.output_dir).absolute().name
-        else:
-            repo_name = self.args.hub_model_id
-        if "/" not in repo_name:
-            repo_name = get_full_repo_name(repo_name, token=self.args.hub_token)
-
-        try:
-            self.repo = Repository(
-                self.args.output_dir,
-                clone_from=repo_name,
-                use_auth_token=use_auth_token,
-            )
-        except EnvironmentError:
-            if self.args.overwrite_output_dir and at_init:
-                # Try again after wiping output_dir
-                shutil.rmtree(self.args.output_dir)
-                self.repo = Repository(
-                    self.args.output_dir,
-                    clone_from=repo_name,
-                    use_auth_token=use_auth_token,
-                )
-            else:
-                raise
-
-        self.repo.git_pull()
-
-        # By default, ignore the checkpoint folders
-        if (
-            not os.path.exists(os.path.join(self.args.output_dir, ".gitignore"))
-            and self.args.hub_strategy != HubStrategy.ALL_CHECKPOINTS
-        ):
-            with open(os.path.join(self.args.output_dir, ".gitignore"), "w", encoding="utf-8") as writer:
-                writer.writelines(["checkpoint-*/"])
-
-        self.push_in_progress = None
-
-    def create_model_card(
-        self,
-        language: Optional[str] = None,
-        license: Optional[str] = None,
-        tags: Optional[str] = None,
-        model_name: Optional[str] = None,
-        finetuned_from: Optional[str] = None,
-        tasks: Optional[str] = None,
-        dataset_tags: Optional[Union[str, List[str]]] = None,
-        dataset: Optional[Union[str, List[str]]] = None,
-        dataset_args: Optional[Union[str, List[str]]] = None,
-    ):
-        if not self.is_world_process_zero():
-            return
-
-        training_summary = TrainingSummary.from_trainer(
-            self,
-            language=language,
-            license=license,
-            tags=tags,
-            model_name=model_name,
-            finetuned_from=finetuned_from,
-            tasks=tasks,
-            dataset_tags=dataset_tags,
-            dataset=dataset,
-            dataset_args=dataset_args,
-        )
-        model_card = training_summary.to_model_card()
-        with open(os.path.join(self.args.output_dir, "README.md"), "w") as f:
-            f.write(model_card)
-
-    def _push_from_checkpoint(self, checkpoint_folder):
-        # Only push from one node.
-        if not self.is_world_process_zero() or self.args.hub_strategy == HubStrategy.END:
-            return
-        # If we haven't finished the last push, we don't do this one.
-        if self.push_in_progress is not None and not self.push_in_progress.is_done:
-            return
-
-        output_dir = self.args.output_dir
-        # To avoid a new synchronization of all model weights, we just copy the file from the checkpoint folder
-        modeling_files = [CONFIG_NAME, WEIGHTS_NAME]
-        for modeling_file in modeling_files:
-            if os.path.isfile(os.path.join(checkpoint_folder, modeling_file)):
-                shutil.copy(os.path.join(checkpoint_folder, modeling_file), os.path.join(output_dir, modeling_file))
-        # Saving the tokenizer is fast and we don't know how many files it may have spawned, so we resave it to be sure.
-        if self.tokenizer is not None:
-            self.tokenizer.save_pretrained(output_dir)
-        # Same for the training arguments
-        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
-
-        try:
-            if self.args.hub_strategy == HubStrategy.CHECKPOINT:
-                # Temporarily move the checkpoint just saved for the push
-                tmp_checkpoint = os.path.join(output_dir, "last-checkpoint")
-                # We have to remove the "last-checkpoint" dir if it exists, otherwise the checkpoint is moved as a
-                # subfolder.
-                if os.path.isdir(tmp_checkpoint):
-                    shutil.rmtree(tmp_checkpoint)
-                shutil.move(checkpoint_folder, tmp_checkpoint)
-
-            if self.args.save_strategy == IntervalStrategy.STEPS:
-                commit_message = f"Training in progress, step {self.state.global_step}"
-            else:
-                commit_message = f"Training in progress, epoch {int(self.state.epoch)}"
-            _, self.push_in_progress = self.repo.push_to_hub(
-                commit_message=commit_message, blocking=False, auto_lfs_prune=True
-            )
-        finally:
-            if self.args.hub_strategy == HubStrategy.CHECKPOINT:
-                # Move back the checkpoint to its place
-                shutil.move(tmp_checkpoint, checkpoint_folder)
-
-    def push_to_hub(self, commit_message: Optional[str] = "End of training", blocking: bool = True, **kwargs) -> str:
-        """
-        Upload *self.model* and *self.tokenizer* to the 🤗 model hub on the repo *self.args.hub_model_id*.
-
-        Parameters:
-            commit_message (`str`, *optional*, defaults to `"End of training"`):
-                Message to commit while pushing.
-            blocking (`bool`, *optional*, defaults to `True`):
-                Whether the function should return only when the `git push` has finished.
-            kwargs:
-                Additional keyword arguments passed along to [`~Trainer.create_model_card`].
-
-        Returns:
-            The url of the commit of your model in the given repository if `blocking=False`, a tuple with the url of
-            the commit and an object to track the progress of the commit if `blocking=True`
-        """
-        # If a user calls manually `push_to_hub` with `self.args.push_to_hub = False`, we try to create the repo but
-        # it might fail.
-        if not hasattr(self, "repo"):
-            self.init_git_repo()
-
-        if self.args.should_save:
-            if self.args.hub_model_id is None:
-                model_name = Path(self.args.output_dir).name
-            else:
-                model_name = self.args.hub_model_id.split("/")[-1]
-
-        # Needs to be executed on all processes for TPU training, but will only save on the processed determined by
-        # self.args.should_save.
-        self.save_model(_internal_call=True)
-
-        # Only push from one node.
-        if not self.is_world_process_zero():
-            return
-
-        git_head_commit_url = self.repo.push_to_hub(
-            commit_message=commit_message, blocking=blocking, auto_lfs_prune=True
-        )
-        # push separately the model card to be independant from the rest of the model
-        if self.args.should_save:
-            self.create_model_card(model_name=model_name, **kwargs)
-            try:
-                self.repo.push_to_hub(
-                    commit_message="update model card README.md", blocking=blocking, auto_lfs_prune=True
-                )
-            except EnvironmentError as exc:
-                logger.error(f"Error pushing update to the model card. Please read logs and retry.\n${exc}")
-
-        return git_head_commit_url
-
-    #
-    # Deprecated code
-    #
-
-    def prediction_loop(
-        self,
-        dataloader: DataLoader,
-        description: str,
-        prediction_loss_only: Optional[bool] = None,
-        ignore_keys: Optional[List[str]] = None,
-        metric_key_prefix: str = "eval",
-    ) -> PredictionOutput:
-        """
-        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
-
-        Works both with or without labels.
-        """
-        args = self.args
-
-        if not has_length(dataloader.dataset):
-            raise ValueError("dataset must implement __len__")
-        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
-
-        # if eval is called w/o train init deepspeed here
-        if args.deepspeed and not self.deepspeed:
-
-            # XXX: eval doesn't have `resume_from_checkpoint` arg but we should be able to do eval
-            # from the checkpoint eventually
-            deepspeed_engine, _, _ = deepspeed_init(self, num_training_steps=0, resume_from_checkpoint=None)
-            self.model = deepspeed_engine.module
-            self.model_wrapped = deepspeed_engine
-            self.deepspeed = deepspeed_engine
-            # XXX: we don't need optim/sched for inference, but this needs to be sorted out, since
-            # for example the Z3-optimizer is a must for zero3 to work even for inference - what we
-            # don't need is the deepspeed basic optimizer which is self.optimizer.optimizer
-            deepspeed_engine.optimizer.optimizer = None
-            deepspeed_engine.lr_scheduler = None
-
-        model = self._wrap_model(self.model, training=False)
-
-        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
-        # while ``train`` is running, cast it to the right dtype first and then put on device
-        if not self.is_in_train:
-            if args.fp16_full_eval:
-                model = model.to(dtype=torch.float16, device=args.device)
-            elif args.bf16_full_eval:
-                model = model.to(dtype=torch.bfloat16, device=args.device)
-
-        batch_size = dataloader.batch_size
-        num_examples = self.num_examples(dataloader)
-        logger.info(f"***** Running {description} *****")
-        logger.info(f"  Num examples = {num_examples}")
-        logger.info(f"  Batch size = {batch_size}")
-        losses_host: torch.Tensor = None
-        preds_host: Union[torch.Tensor, List[torch.Tensor]] = None
-        labels_host: Union[torch.Tensor, List[torch.Tensor]] = None
-
-        world_size = max(1, args.world_size)
-
-        eval_losses_gatherer = DistributedTensorGatherer(world_size, num_examples, make_multiple_of=batch_size)
-        if not prediction_loss_only:
-            # The actual number of eval_sample can be greater than num_examples in distributed settings (when we pass
-            # a batch size to the sampler)
-            make_multiple_of = None
-            if hasattr(dataloader, "sampler") and isinstance(dataloader.sampler, SequentialDistributedSampler):
-                make_multiple_of = dataloader.sampler.batch_size
-            preds_gatherer = DistributedTensorGatherer(world_size, num_examples, make_multiple_of=make_multiple_of)
-            labels_gatherer = DistributedTensorGatherer(world_size, num_examples, make_multiple_of=make_multiple_of)
-
-        model.eval()
-
-        if is_torch_tpu_available():
-            dataloader = pl.ParallelLoader(dataloader, [args.device]).per_device_loader(args.device)
-
-        if args.past_index >= 0:
-            self._past = None
-
-        self.callback_handler.eval_dataloader = dataloader
-
-        for step, inputs in enumerate(dataloader):
-            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
-            if loss is not None:
-                losses = loss.repeat(batch_size)
-                losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
-            if logits is not None:
-                preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
-            if labels is not None:
-                labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
-            self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
-
-            # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
-            if args.eval_accumulation_steps is not None and (step + 1) % args.eval_accumulation_steps == 0:
-                eval_losses_gatherer.add_arrays(self._gather_and_numpify(losses_host, "eval_losses"))
-                if not prediction_loss_only:
-                    preds_gatherer.add_arrays(self._gather_and_numpify(preds_host, "eval_preds"))
-                    labels_gatherer.add_arrays(self._gather_and_numpify(labels_host, "eval_label_ids"))
-
-                # Set back to None to begin a new accumulation
-                losses_host, preds_host, labels_host = None, None, None
-
-        if args.past_index and hasattr(self, "_past"):
-            # Clean the state at the end of the evaluation loop
-            delattr(self, "_past")
-
-        # Gather all remaining tensors and put them back on the CPU
-        eval_losses_gatherer.add_arrays(self._gather_and_numpify(losses_host, "eval_losses"))
-        if not prediction_loss_only:
-            preds_gatherer.add_arrays(self._gather_and_numpify(preds_host, "eval_preds"))
-            labels_gatherer.add_arrays(self._gather_and_numpify(labels_host, "eval_label_ids"))
-
-        eval_loss = eval_losses_gatherer.finalize()
-        preds = preds_gatherer.finalize() if not prediction_loss_only else None
-        label_ids = labels_gatherer.finalize() if not prediction_loss_only else None
-
-        if self.compute_metrics is not None and preds is not None and label_ids is not None:
-            metrics = self.compute_metrics(EvalPrediction(predictions=preds, label_ids=label_ids))
-        else:
-            metrics = {}
-
-        # To be JSON-serializable, we need to remove numpy types or zero-d tensors
-        metrics = denumpify_detensorize(metrics)
-
-        if eval_loss is not None:
-            metrics[f"{metric_key_prefix}_loss"] = eval_loss.mean().item()
-
-        # Prefix all keys with metric_key_prefix + '_'
-        for key in list(metrics.keys()):
-            if not key.startswith(f"{metric_key_prefix}_"):
-                metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
-
-        return PredictionOutput(predictions=preds, label_ids=label_ids, metrics=metrics)
-
-    def _gather_and_numpify(self, tensors, name):
-        """
-        Gather value of `tensors` (tensor or list/tuple of nested tensors) and convert them to numpy before
-        concatenating them to `gathered`
-        """
-        if tensors is None:
-            return
-        if is_torch_tpu_available():
-            tensors = nested_xla_mesh_reduce(tensors, name)
-        elif is_sagemaker_mp_enabled():
-            tensors = smp_gather(tensors)
-        elif self.args.local_rank != -1:
-            tensors = distributed_concat(tensors)
-
-        return nested_numpify(tensors)

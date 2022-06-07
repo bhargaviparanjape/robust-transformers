@@ -1653,6 +1653,8 @@ if is_torch_available():
     _import_structure["trainer_seq2seq"] = ["Seq2SeqTrainer"]
     _import_structure["trainer_dro"] = ["TrainerDro"]
     _import_structure["dro_loss"] = ["LossComputer", "DroArguments"]
+    _import_structure["cgd_loss"] = ["CGDLossComputer"]
+    _import_structure["gcdro_loss"] = ["GCDROLossComputer"]
 else:
     from .utils import dummy_pt_objects
 
@@ -3733,6 +3735,8 @@ if TYPE_CHECKING:
         from .trainer_seq2seq import Seq2SeqTrainer
         from .trainer_dro import TrainerDro
         from .dro_loss import LossComputer, DroArguments
+        from .cgd_loss import CGDLossComputer
+        from .gcdro_loss import GCDROLossComputer
     else:
         from .utils.dummy_pt_objects import *
 

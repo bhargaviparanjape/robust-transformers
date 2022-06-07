@@ -69,7 +69,7 @@ class CGDLossComputer(LossComputer):
             return data.to(**kwargs)
         return data
 
-    def loss(self, per_sample_losses, yhat, y, group_idx=None, is_training=False):
+    def loss(self, per_sample_losses, yhat, y, group_idx=None, group_distribution=None, instance_weights=None, is_training=False):
         # compute per-sample and per-group losses
         # per_sample_losses = self.criterion(yhat, y) #TODO: Change, per_sample_loss is already computed.
         group_loss, group_count = self.compute_group_avg(per_sample_losses, group_idx)
