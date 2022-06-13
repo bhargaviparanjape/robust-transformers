@@ -19,9 +19,9 @@ python run_glue_cartography.py \
     --model_name_or_path roberta-base \
     --custom_task_name mnli_resplit \
     --robust_algorithm GCDRO \
-    --train_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/train_resplit.json \
-    --validation_file  /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/dev_resplit.json \
-    --test_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/dev_resplit.json \
+    --train_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/automatic_slicing/train_resplit_slicing_error_aware_12slices_y_yhat_5.0.json \
+    --validation_file  /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/automatic_slicing/dev_resplit_slicing_12slices.json \
+    --test_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/automatic_slicing/dev_resplit_slicing_12slices.json \
     --save_total_limit 2 \
     --do_train \
     --do_eval \
@@ -30,7 +30,7 @@ python run_glue_cartography.py \
     --per_device_train_batch_size 256 \
     --learning_rate 2e-5 \
     --num_train_epochs 35 \
-    --output_dir  /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_gcdro_roberta_bz256_epochs35_betacover \
+    --output_dir  /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_gcdro_roberta_bz256_epochs35_betacover_domino12slices_y_yhat_5.0_erroraware_evaldomino12 \
     --overwrite_cache --overwrite_output_dir \
     --cache_dir /gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/cache_ \
     --is_robust \
@@ -40,9 +40,8 @@ python run_glue_cartography.py \
     --alpha 0.2 \
     --beta 0.5 \
     --beta_ema 0.5 \
+    --greater_is_better true \
     --do_instance_reweight \
-
-#--do_instance_reweight \
 
 #--dro-alpha 0.2 --beta-cover-instances 0.5 --ema 0.5 --beta-ema 0.5 \ 
 #--do_instance_reweight \

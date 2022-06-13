@@ -1719,7 +1719,7 @@ class TrainerDro:
             curr_worst_valid_acc = min([acc for _, acc in valid_group_acc])
             sorted_by_group_id = sorted(valid_group_acc, key=lambda tup: tup[0])
             group_acc = " ".join(["%d: %.3f" % (idx, acc if acc > 0 else -acc) for idx, acc in sorted_by_group_id])
-            become_better = (worst_valid_acc is not None and worst_valid_acc > worst_valid_acc) or worst_valid_acc is None
+            become_better = (worst_valid_acc is not None and curr_worst_valid_acc > worst_valid_acc) or worst_valid_acc is None
             worst_valid_acc = curr_worst_valid_acc if worst_valid_acc is None else max(curr_worst_valid_acc, worst_valid_acc)
             bad_counts = 0 if become_better else bad_counts + 1
 
@@ -2836,11 +2836,12 @@ class TrainerDro:
         else:
             metrics = {}
 
-        # Compute Worst Group Metrics!
-        n_eval_groups = self.val_loss_computer.n_groups
-        key = "accuracy"
-        for group_idx in range(n_eval_groups):
-            metrics[f"group_{key}_{group_idx}"] = self.val_loss_computer.avg_group_acc[group_idx]
+        # Compute Worst Group Metrics, if group information is evailable in the evaluation set.
+        if hasattr(self, "val_loss_computer"):
+            n_eval_groups = self.val_loss_computer.n_groups
+            key = "accuracy"
+            for group_idx in range(n_eval_groups):
+                metrics[f"group_{key}_{group_idx}"] = self.val_loss_computer.avg_group_acc[group_idx]
 
         # To be JSON-serializable, we need to remove numpy types or zero-d tensors
         metrics = denumpify_detensorize(metrics)

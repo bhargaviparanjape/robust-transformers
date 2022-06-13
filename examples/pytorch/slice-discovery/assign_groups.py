@@ -14,6 +14,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_file", type=str, default=None)
     parser.add_argument("--output_file", type=str, default=None)
     parser.add_argument("--split_by_label", action="store_true", default=False)
+    parser.add_argument("--split_strategy", type=str, default="domino")
     args = parser.parse_args()
 
     pd_df = pd.read_pickle(args.cluster_assgn_file)
@@ -38,6 +39,7 @@ if __name__ == "__main__":
     print(Counter(group_assignment.values()))
 
 
+    # TODO: CURRENTLY ONLY SUPPORTS MNLI. COMBINE WITH generate_features.py CODE
     label_to_id = {"entailment": 0, "neutral":1, "contradiction":2}
 
     dataset = [json.loads(line) for line in open(args.dataset_file)]

@@ -99,6 +99,10 @@ class DataTrainingArguments:
         default="mnli_resplit",
         metadata={"help": "The name of the task to train on: " + ", ".join(task_to_keys.keys())},
     )
+    transform_labels: bool = field(
+        default=False,
+        metadata={"help": "Whether to transform class labels for a task to fit OOD datasets."},
+    )
     dataset_name: Optional[str] = field(
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
     )
@@ -475,6 +479,17 @@ def main():
     def compute_metrics(p: EvalPrediction):
         preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
         preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
+        if data_args.transform_labels and data_args.custom_task_name == "mnli_resplit":
+            keep = [label_to_id["entailment"], label_to_id["neutral"]]
+            neutral_class = label_to_id["neutral"]
+            new_preds = []
+            for pred in preds:
+                if pred in keep:
+                    new_preds.append(pred)
+                else:
+                    new_preds.append(neutral_class)
+            preds = np.array(new_preds, dtype=np.int32)
+            # preds = np.asarray([p for p in preds if p in keep else neutral_class])
         if data_args.task_name is not None:
             result = metric.compute(predictions=preds, references=p.label_ids)
             if len(result) > 1:

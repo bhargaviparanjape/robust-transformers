@@ -3,9 +3,9 @@ python generate_features.py \
     --model_name_or_path ${model} \
     --custom_task_name mnli_resplit \
     --cluster_dev_features \
-    --n_slices 500 \
+    --n_slices 24 \
     --init_type confusion \
-    --n_mixture_components 500 \
+    --n_mixture_components 24 \
     --train_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/train_resplit.json \
     --validation_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/dev_resplit.json \
     --test_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/dev_resplit.json \
