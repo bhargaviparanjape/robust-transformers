@@ -82,7 +82,7 @@ custom_task_to_keys = {
     "fever": ("sentence1", "sentence2"),
     "commonsenseqa": ("sentence1", "sentence2"),
     "wanli": ("premise", "hypothesis"),
-    "qqp": ("question1", "question2"),
+    "qqp": ("sentence1", "sentence2"),
 }
 
 @dataclass
@@ -185,13 +185,19 @@ class DataTrainingArguments:
         default=False, metadata={"help": "Use differences between pretrained and finetuned model to find pretrained features."}
     )
     cluster_dev_features: Optional[bool] = field(
-        default=False, metadata={"help": "Cluster training and evaluation data features."}
+        default=False, metadata={"help": "Cluster evaluation data features."}
     )
     cluster_train_features: Optional[bool] = field(
-        default=False, metadata={"help": "Cluster training and evaluation data features."}
+        default=False, metadata={"help": "Cluster training data features."}
+    )
+    cluster_all_features: Optional[bool] = field(
+        default=False, metadata={"help": "Cluster training and evaluation data features together."}
     )
     assign_train_groups: Optional[bool] = field(
         default=False, metadata={"help": "Greedily Assign groups based on DOMINO membership."}
+    )
+    assign_all_groups: Optional[bool] = field(
+        default=False, metadata={"help": "Greedily Assign groups based on DOMINO membership, during training and evaluation."}
     )
     assign_dev_groups: Optional[bool] = field(
         default=False, metadata={"help": "Assign groups based on DOMINO membership"}
@@ -516,8 +522,8 @@ def main():
 
     # Look at trainer init and init a trainer even here: easiest if initialized? 
     # Initialize our Trainer
-
     if data_args.create_features:
+        # TODO: tweak code to create features for a bunch of folds at once.
         trainer = TrainerDro(
         model=model,
         args=training_args,
@@ -560,8 +566,8 @@ def main():
         kfold_data_prefix = data_args.kfold_data_path_prefix
         kfold_model_prefix = model_args.kfold_model_path_prefix
         filetype = "json"
-        train_files = [f"{kfold_data_prefix}{split}.{filetype}" for split in range(0, data_args.kfold)]
-        model_folders = [f"{kfold_model_prefix}{split}" for split in range(0, data_args.kfold)]
+        train_files = [f"{kfold_data_prefix}{split_no}.{filetype}" for split_no in range(0, data_args.kfold)]
+        model_folders = [f"{kfold_model_prefix}{split_no}" for split_no in range(0, data_args.kfold)]
         data_dict = {}
         fold_dps = []
         for fold_no, (train_file, model_path) in enumerate(zip(train_files, model_folders)):
@@ -602,6 +608,67 @@ def main():
         pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "error_aware_output_{0}_slices.pkl".format(data_args.n_slices)))
 
 
+    if data_args.cluster_all_features:
+        id_to_label = {v:k for k,v in label_to_id.items()}
+        split = "dev"
+        # Get json datasets from all split files of the training set.
+        # Load training, validation and test data from file paths.
+        kfold_data_prefix = data_args.kfold_data_path_prefix
+        kfold_model_prefix = model_args.kfold_model_path_prefix
+        filetype = "json"
+        train_files = [f"{kfold_data_prefix}{split_no}.{filetype}" for split_no in range(0, data_args.kfold)]
+        model_folders = [f"{kfold_model_prefix}{split_no}" for split_no in range(0, data_args.kfold)]
+        data_dict = {}
+        fold_dps = []
+        for fold_no, (train_file, model_path) in enumerate(zip(train_files, model_folders)):
+            data_files = {"train": train_file}
+            raw_datasets = load_dataset("json", data_files=data_files, cache_dir=model_args.cache_dir)
+            fold_dataset = raw_datasets["train"]
+            for ex in fold_dataset:
+                data_dict[ex["guid"]] = ex
+            fold_pd_df = pd.read_pickle(os.path.join(model_path, "clustering", "{0}.pkl".format(split)))
+            fold_logits = np.stack(fold_pd_df["pred_probs"].to_numpy())
+            fold_dps.append(mk.DataPanel({
+                'guid': fold_pd_df["guid"].to_list(),
+                'group': np.stack(fold_pd_df["group"].to_numpy()),
+                'emb': np.stack(fold_pd_df["emb"].to_numpy()),
+                'target': np.stack(fold_pd_df["target"].to_numpy()),
+                'pred_probs': np.asarray(torch.softmax(torch.tensor(fold_logits), dim=-1))
+            }))
+
+        # load dev set as well 
+        dev_pd_df = pd.read_pickle(os.path.join(model_args.model_name_or_path, "clustering", "{0}.pkl".format(split)))
+        dev_logits = np.stack(dev_pd_df["pred_probs"].to_numpy())
+        fold_dps.append(mk.DataPanel({
+                'guid': dev_pd_df["guid"].to_list(),
+                'group': np.stack(dev_pd_df["group"].to_numpy()),
+                'emb': np.stack(dev_pd_df["emb"].to_numpy()),
+                'target': np.stack(dev_pd_df["target"].to_numpy()),
+                'pred_probs': np.asarray(torch.softmax(torch.tensor(dev_logits), dim=-1))
+            }))
+
+        comb_dp = mk.concat(fold_dps)
+
+        # y_hat_log_likelihood_weight may have to be up-played when slices are fewer and far between.
+        domino = DominoSlicer(n_slices=data_args.n_slices, 
+        n_mixture_components=data_args.n_mixture_components, 
+        init_params=data_args.init_type,
+        y_log_likelihood_weight=data_args.y_log_likelihood_weight,
+        y_hat_log_likelihood_weight=data_args.y_hat_log_likelihood_weight,
+        max_iter=200)
+
+        domino.fit(
+            data=comb_dp, embeddings="emb", targets="target", pred_probs="pred_probs"
+        )
+        # Save the domino class as a pickle
+        pickle.dump(domino, open(os.path.join(training_args.output_dir, "clustering", "combined_dominoclass_{0}_slices.pkl".format(data_args.n_slices)), "wb"))
+        comb_dp["domino_slices"] = domino.transform(
+            data=comb_dp, embeddings="emb", targets="target", pred_probs="pred_probs"
+        )
+        pd_df = mk.DataPanel.to_pandas(comb_dp)
+        logger.info("***** Dumping group assingments for {0} to file *****".format(split))
+        pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "combined_output_{0}_slices.pkl".format(data_args.n_slices)))
+
     if data_args.assign_train_groups:
         pd_df = pd.read_pickle(data_args.cluster_assgn_file)
         slices =  np.stack(pd_df["domino_slices"].to_numpy())
@@ -630,15 +697,45 @@ def main():
                 new_ex["group_distribution"] = group_distributions[guid]
                 fout.write(json.dumps(new_ex) + "\n")
         
-        
 
-    if data_args.assign_dev_groups:
-        pass
+    if data_args.assign_all_groups:
+        pd_df = pd.read_pickle(data_args.cluster_assgn_file)
+        slices =  np.stack(pd_df["domino_slices"].to_numpy())
+        group_assignment = {}
+        group_distributions = {}
+        for i in range(len(pd_df)):
+            ## Usually analysis is done with group assignment only if value is above a threshold.
+            slice = int(np.argmax(pd_df.iloc[i]["domino_slices"]))
+            slice_val = np.max(pd_df.iloc[i]["domino_slices"])
+            chosen_slice = slice
+            guid = pd_df.iloc[i]["guid"]
+            group_distributions[guid] = list(pd_df.iloc[i]["domino_slices"])
+            group_assignment[guid] = chosen_slice
 
-
-        
-
-
+        train_dataset = [json.loads(line) for line in open(data_args.train_file)]
+        validation_dataset = [json.loads(line) for line in open(data_args.validation_file)]
+        split_by_label = False
+        with open(data_args.output_file, "w") as fout:
+            for ex in train_dataset:
+                guid = ex["guid"]
+                new_ex = ex
+                if split_by_label:
+                    new_ex["group"] = 3*((group_assignment[guid])) + label_to_id[ex["label"]]
+                else:
+                    new_ex["group"] = group_assignment[guid]
+                new_ex["group_distribution"] = group_distributions[guid]
+                fout.write(json.dumps(new_ex) + "\n")
+        dev_output_file = data_args.output_file.replace("train", "dev")
+        with open(dev_output_file, "w") as fout:
+            for ex in validation_dataset:
+                guid = ex["guid"]
+                new_ex = ex
+                if split_by_label:
+                    new_ex["group"] = 3*((group_assignment[guid])) + label_to_id[ex["label"]]
+                else:
+                    new_ex["group"] = group_assignment[guid]
+                new_ex["group_distribution"] = group_distributions[guid]
+                fout.write(json.dumps(new_ex) + "\n")     
 
 
 if __name__ == "__main__":

@@ -72,7 +72,7 @@ custom_task_to_keys = {
     "winogrande": ("sentence1", "sentence2"),
     "commonsenseqa": ("sentence1", "sentence2"),
     "wanli": ("premise", "hypothesis"),
-    "qqp": ("question1", "question2"),
+    "qqp": ("sentence1", "sentence2"),
     "sst2": ("sentence", None),
     "fever": ("sentence1", "sentence2"),
 }

@@ -1,21 +1,20 @@
+data=/mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI
 model=/mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_erm_roberta_bz32_epochs3
 python error_aware_slice_discovery.py \
     --kfold_model_path_prefix /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_erm_roberta_bz32_epoch3_kfold \
-    --kfold_data_path_prefix /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/kfold/train_fold_ \
+    --kfold_data_path_prefix ${data}/kfold/train_fold_ \
     --model_name_or_path ${model} \
     --pretrained_model_name_or_path roberta-base \
     --custom_task_name mnli_resplit \
-    --y_log_likelihood_weight 5 \
-    --y_hat_log_likelihood_weight 5 \
-    --assign_train_groups \
-    --cluster_assgn_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_erm_roberta_bz32_epochs3/clustering/error_aware_output_12_slices.pkl \
-    --output_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/automatic_slicing/train_resplit_slicing_error_aware_12slices_y_yhat_5.0.json \
-    --n_slices 12 \
+    --cluster_all_features \
+    --cluster_assgn_file ${model}/clustering/combined_output_125_slices.pkl \
+    --output_file ${data}/automatic_slicing/train_resplit_slicing_combined_125slices.json \
+    --n_slices 125 \
     --init_type confusion \
-    --n_mixture_components 12 \
-    --train_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/train_resplit.json \
-    --validation_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/dev_resplit.json \
-    --test_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/dev_resplit.json \
+    --n_mixture_components 125 \
+    --train_file ${data}/train_resplit.json \
+    --validation_file ${data}/dev_resplit.json \
+    --test_file ${data}/test_resplit.json \
     --max_seq_length 128 \
     --per_device_train_batch_size 256 \
     --per_device_eval_batch_size 256 \
