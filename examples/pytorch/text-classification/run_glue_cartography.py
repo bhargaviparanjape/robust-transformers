@@ -38,6 +38,7 @@ from transformers import (
     HfArgumentParser,
     PretrainedConfig,
     TrainerDro,
+    TrainerDroGA,
     TrainingArguments,
     DroArguments,
     cartography_data_collator,
@@ -534,16 +535,29 @@ def main():
 
 
     # Initialize our Trainer
-    trainer = TrainerDro(
-        model=model,
-        args=training_args,
-        dro_args=dro_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        compute_metrics=compute_metrics,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
+    if training_args.gradient_accumulation_steps > 1:
+        trainer = TrainerDroGA(
+            model=model,
+            args=training_args,
+            dro_args=dro_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=eval_dataset if training_args.do_eval else None,
+            compute_metrics=compute_metrics,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+        )
+    else:
+        trainer = TrainerDro(
+            model=model,
+            args=training_args,
+            dro_args=dro_args,
+            train_dataset=train_dataset if training_args.do_train else None,
+            eval_dataset=eval_dataset if training_args.do_eval else None,
+            compute_metrics=compute_metrics,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+        )
+
 
     # Training
     if training_args.do_train:

@@ -6,12 +6,12 @@ python error_aware_slice_discovery.py \
     --model_name_or_path ${model} \
     --pretrained_model_name_or_path roberta-base \
     --custom_task_name mnli_resplit \
-    --cluster_all_features \
-    --cluster_assgn_file ${model}/clustering/combined_output_125_slices.pkl \
-    --output_file ${data}/automatic_slicing/train_resplit_slicing_combined_125slices.json \
-    --n_slices 125 \
+    --assign_train_groups \
+    --cluster_assgn_file ${model}/clustering/error_aware_output_24_slices.pkl \
+    --output_file ${data}/automatic_slicing/train_resplit_slicing_error_aware_24slices.json \
+    --n_slices 24 \
     --init_type confusion \
-    --n_mixture_components 125 \
+    --n_mixture_components 24 \
     --train_file ${data}/train_resplit.json \
     --validation_file ${data}/dev_resplit.json \
     --test_file ${data}/test_resplit.json \

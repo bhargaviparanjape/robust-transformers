@@ -1651,10 +1651,13 @@ if is_torch_available():
     _import_structure["trainer"] = ["Trainer"]
     _import_structure["trainer_pt_utils"] = ["torch_distributed_zero_first"]
     _import_structure["trainer_seq2seq"] = ["Seq2SeqTrainer"]
+    _import_structure["trainer_slicer"] = ["TrainerSlicer"]
     _import_structure["trainer_dro"] = ["TrainerDro"]
+    _import_structure["trainer_dro_ga"] = ["TrainerDroGA"]
     _import_structure["dro_loss"] = ["LossComputer", "DroArguments"]
     _import_structure["cgd_loss"] = ["CGDLossComputer"]
     _import_structure["gcdro_loss"] = ["GCDROLossComputer"]
+    _import_structure["gcdro_loss_ga"] = ["GCDROLossComputerWithGA"]
 else:
     from .utils import dummy_pt_objects
 
@@ -3734,9 +3737,12 @@ if TYPE_CHECKING:
         from .trainer_pt_utils import torch_distributed_zero_first
         from .trainer_seq2seq import Seq2SeqTrainer
         from .trainer_dro import TrainerDro
+        from .trainer_dro_ga import TrainerDroGA
+        from .trainer_slicer import TrainerSlicer
         from .dro_loss import LossComputer, DroArguments
         from .cgd_loss import CGDLossComputer
         from .gcdro_loss import GCDROLossComputer
+        from .gcdro_loss_ga import GCDROLossComputerWithGA
     else:
         from .utils.dummy_pt_objects import *
 

@@ -1,8 +1,6 @@
 import os
 import torch
 import torch.nn as nn
-import torch.distributed as dist
-from torch.distributed import ReduceOp
 import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass, field
@@ -10,7 +8,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 
-class GCDROLossComputer:
+class GCDROLossComputerWithGA:
     def __init__(self, dro_args, training_args, n_groups, group_counts, adj=None):
         self.is_robust = dro_args.is_robust
         self.gamma = dro_args.gamma # ema for group loss 
@@ -69,7 +67,7 @@ class GCDROLossComputer:
             return data.to(**kwargs)
         return data
 
-    def loss(self, per_sample_losses, yhat, y, group_idx=None, group_distribution=None, instance_weights=None, is_training=False):
+    def loss(self, per_sample_losses, yhat, y, group_idx=None, group_distribution=None, instance_weights=None, batch_group_loss=None, group_counts=None, update_avg=None, is_training=False):
         # compute per-sample and per-group losses
         # per_sample_losses = self.criterion(yhat, y) #TODO: Change, per_sample_loss is already computed.
 
@@ -81,41 +79,33 @@ class GCDROLossComputer:
         if instance_weights is not None and self.do_instance_reweight:
             per_sample_losses = instance_weights*per_sample_losses
 
-        # group_loss, group_count = self.compute_group_avg(per_sample_losses, group_idx)
+        minibatch_group_loss, minibatch_group_count = self.compute_group_avg(per_sample_losses, group_idx)
         minibatch_group_acc, minibatch_group_count = self.compute_group_avg((torch.argmax(yhat,1)==y).float(), group_idx)
+        
+        group_loss = self.compute_group_loss(per_sample_losses, group_idx)
+        # normalize group_loss by total group counts.
+        globally_normalized_group_loss = group_loss/(group_counts + (group_counts==0).float())
 
-        # update historical losses
-        group_losses = self.compute_group_loss(per_sample_losses, group_idx)
-        group_map = (group_idx == self._prepare_input(torch.arange(self.n_groups).unsqueeze(1).long())).float()
-        group_count = group_map.sum(1)
-
-        dist.all_reduce(group_count, op=ReduceOp.SUM)
-        dist.all_reduce(group_losses, op=ReduceOp.SUM)
-
-        group_denom = group_count + (group_count==0).float() # avoid nans
-        group_losses = (group_losses)/group_denom
-        self.update_exp_avg_loss(group_losses, group_count)
+        # TODO: Update historical losses after computing robust loss
+        if update_avg:
+            batch_group_loss += globally_normalized_group_loss
+            self.update_exp_avg_loss(batch_group_loss, group_counts)
 
         # compute overall loss
-        # TODO: create a copy of group losses so that it gets used instead of global group loss? 
-        actual_loss, weights = self.compute_robust_loss_btl(group_losses, group_count)
-        #import pdb; pdb.set_trace()
+        actual_loss, weights = self.compute_robust_loss_btl(globally_normalized_group_loss, group_counts)
+
         
-        # update stats
-        self.update_stats(actual_loss, group_losses, minibatch_group_acc, minibatch_group_count, weights)
+        # TODO: update stats still uses minibatch statistics.
+        self.update_stats(actual_loss, minibatch_group_loss, minibatch_group_acc, minibatch_group_count, weights)
 
-        return actual_loss
-
-    def compute_group_loss(self, losses, group_idx):
-        group_map = (group_idx == self._prepare_input(torch.arange(self.n_groups).unsqueeze(1).long())).float()
-        group_loss = (group_map @ losses.view(-1))
-        return group_loss
+        return actual_loss, globally_normalized_group_loss
 
     def compute_robust_loss_btl(self, group_loss, group_count):
         adjusted_loss = self.exp_avg_loss + self.adj/torch.sqrt(self.group_counts)
         return self.compute_robust_loss_greedy(group_loss, adjusted_loss)
 
     def compute_robust_loss_greedy(self, group_loss, ref_loss):
+        #TODO: ref_loss if all zeros, resort to using unform weights
         sorted_idx = ref_loss.sort(descending=True)[1]
         #sorted_loss = group_loss[sorted_idx]
         past_frac = self.count_cat / self.count_cat.sum() 
@@ -151,6 +141,11 @@ class GCDROLossComputer:
 
         return robust_loss, self.adv_probs
 
+    def compute_group_loss(self, losses, group_idx):
+        group_map = (group_idx == self._prepare_input(torch.arange(self.n_groups).unsqueeze(1).long())).float()
+        group_loss = (group_map @ losses.view(-1))
+        return group_loss
+
     def compute_group_avg(self, losses, group_idx):
         # compute observed counts and mean loss for each group
         group_map = (group_idx == self._prepare_input(torch.arange(self.n_groups).unsqueeze(1).long())).float()
@@ -163,9 +158,11 @@ class GCDROLossComputer:
         ## TODO: Chunting's code is doing a different kind of exponential averaging, exp_avf_initialized not used.
         prev_weights = (1 - self.gamma*(group_count>0).float()) * (self.exp_avg_initialized>0).float()
         curr_weights = 1 - prev_weights
+        # self.exp_avg_loss is updated only once, based off of group_loss accumulated over the entire batch.
         self.exp_avg_loss = self.exp_avg_loss * prev_weights + group_loss*curr_weights
 
         ## TODO: Chunting's code is also doing an exponential averaging of counts (with alpha 0.05)
+        ## update count_cat only once at the end of gradient accumulation.
         self.count_cat = self.count_cat.mul(1 - 0.05).add(group_count, alpha=0.05)
         
         self.exp_avg_initialized = (self.exp_avg_initialized>0) + (group_count>0)

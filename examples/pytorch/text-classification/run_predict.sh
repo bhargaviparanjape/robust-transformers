@@ -1,10 +1,10 @@
 #model=/mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/automatic_clustering/mnli_erm_rw_roberta_bz32_epoch3_slices24_devbased
-model=/mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_gcdro_roberta_bz256_epochs35_betacover_domino24slices_erroraware_evaldomino24/best_checkpoint
-train_dataset=NLI/wanli/wanli/validation.json
-dataset=NLI/wanli/wanli/validation.json
+model=/mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_erm_roberta_bz256_epochs30/checkpoint-5642
+train_dataset=NLI/MNLI/eval_sets/snli_validation.json
+dataset=NLI/MNLI/eval_sets/snli_validation.json
 python run_glue_cartography.py \
     --model_name_or_path ${model} \
-    --custom_task_name wanli \
+    --custom_task_name mnli_resplit \
     --train_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/${train_dataset} \
     --validation_file  /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/${dataset} \
     --test_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/${dataset}  \

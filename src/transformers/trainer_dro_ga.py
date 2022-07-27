@@ -138,7 +138,7 @@ from .utils import logging
 
 from .dro_loss import LossComputer, DroArguments
 from .cgd_loss import CGDLossComputer
-from .gcdro_loss import GCDROLossComputer
+from .gcdro_loss_ga import GCDROLossComputerWithGA
 from transformers import dro_loss
 
 
@@ -204,7 +204,7 @@ SCHEDULER_NAME = "scheduler.pt"
 SCALER_NAME = "scaler.pt"
 
 
-class TrainerDro:
+class TrainerDroGA:
     """
     Trainer is a simple but feature-complete training and eval loop for PyTorch, optimized for 🤗 Transformers.
 
@@ -546,7 +546,7 @@ class TrainerDro:
                     adj=adjustments)
             elif dro_args.robust_algorithm == "GCDRO":
                 ## In order to do instance reweighting at the end of every epoch, Dataset object will have to be separately defined?
-                self.train_loss_computer = GCDROLossComputer(
+                self.train_loss_computer = GCDROLossComputerWithGA(
                     dro_args=dro_args,
                     training_args=args,
                     # dataset=dataset['train_data'], ## Why is this needed? to compute n_groups, group_counts which are passed as arguments now.
@@ -963,7 +963,7 @@ class TrainerDro:
                 },
             ]
 
-            optimizer_cls, optimizer_kwargs = TrainerDro.get_optimizer_cls_and_kwargs(self.args)
+            optimizer_cls, optimizer_kwargs = TrainerDroGA.get_optimizer_cls_and_kwargs(self.args)
 
             if self.sharded_ddp == ShardedDDPOption.SIMPLE:
                 self.optimizer = OSS(
@@ -1546,139 +1546,139 @@ class TrainerDro:
             train_logits = None
             train_losses = None
 
-            for step, inputs in enumerate(epoch_iterator):
-
-                # Skip past any already trained steps if resuming training
-                if steps_trained_in_current_epoch > 0:
-                    steps_trained_in_current_epoch -= 1
-                    if steps_trained_progress_bar is not None:
-                        steps_trained_progress_bar.update(1)
-                    if steps_trained_in_current_epoch == 0:
-                        self._load_rng_state(resume_from_checkpoint)
-                    continue
-                elif steps_trained_progress_bar is not None:
-                    steps_trained_progress_bar.close()
-                    steps_trained_progress_bar = None
-
+            # Change logic slightly, so that you collect as many batches as there are gradient accumulation steps
+            # compute a quick count over groups and pass it as an input vector before running the forward pass itself. 
+            # One danger is that you'll still run out of gpu space.
+            mega_batches = []
+            accumulated_group_loss = self._prepare_input(torch.zeros(self.train_loss_computer.n_groups).float())
+            for step, inputs in enumerate(epoch_iterator):                
                 if step % args.gradient_accumulation_steps == 0:
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
-
-                train_ids_batch = inputs["guid"]
-                if (
-                    ((step + 1) % args.gradient_accumulation_steps != 0)
-                    and args.local_rank != -1
-                    and args._no_sync_in_gradient_accumulation
-                ):
-                    # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
-                    with model.no_sync():
-                        tr_loss_step, batch_logits = self.training_step(model, inputs)
-                else:
-                    tr_loss_step, batch_logits = self.training_step(model, inputs)
-                
-                # loss.backward() already computed and loss returned detached. 
-                if train_logits is None:  # Keep track of training dynamics.
-                    train_ids = train_ids_batch
-                    train_logits = batch_logits[0].detach().cpu().numpy()
-                    train_golds = inputs["labels"].detach().cpu().numpy()
-                    # TODO: Check dimension of loss, also does it make sense to detach before optimization.
-                    train_losses = tr_loss_step.cpu().numpy()
-                else:
-                    train_ids = np.append(train_ids, train_ids_batch)
-                    train_logits = np.append(train_logits, batch_logits[0].detach().cpu().numpy(), axis=0)
-                    train_golds = np.append(train_golds, inputs["labels"].detach().cpu().numpy())
-                    train_losses = np.append(train_losses, tr_loss_step.cpu().numpy())
-                
-
-                if (
-                    args.logging_nan_inf_filter
-                    and not is_torch_tpu_available()
-                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
-                ):
-                    # if loss is nan or inf simply add the average of previous logged losses
-                    tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
-                else:
-                    tr_loss += tr_loss_step
-
-                self.current_flos += float(self.floating_point_ops(inputs))
-
-                # Optimizer step for deepspeed must be called on every step regardless of the value of gradient_accumulation_steps
-                if self.deepspeed:
-                    self.deepspeed.step()
 
                 if (step + 1) % args.gradient_accumulation_steps == 0 or (
                     # last step in epoch but step is always smaller than gradient_accumulation_steps
                     steps_in_epoch <= args.gradient_accumulation_steps
                     and (step + 1) == steps_in_epoch
                 ):
-                    # Gradient clipping
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
-                        # deepspeed does its own clipping
+                    mega_batches.append(inputs)
+                    
+                    # TODO: Process group counts and add to each minibatch in mega_batches
+                    for substep, inputs in enumerate(mega_batches):
 
-                        if self.do_grad_scaling:
-                            # Reduce gradients first for XLA
-                            if is_torch_tpu_available():
-                                gradients = xm._fetch_gradients(self.optimizer)
-                                xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
-                            # AMP: gradients need unscaling
-                            self.scaler.unscale_(self.optimizer)
+                        train_ids_batch = inputs["guid"]
+                        train_groups_batch = inputs["group"]
 
-                        if hasattr(self.optimizer, "clip_grad_norm"):
-                            # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
-                            self.optimizer.clip_grad_norm(args.max_grad_norm)
-                        elif hasattr(model, "clip_grad_norm_"):
-                            # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
-                            model.clip_grad_norm_(args.max_grad_norm)
+                        # Compute group counts and add additional field to inputs
+                        group_map =  (train_groups_batch ==  torch.arange(self.train_loss_computer.n_groups).unsqueeze(1))
+                        inputs["group_counts"] = group_map.sum(1)
+
+                        if substep == len(mega_batches) - 1:
+                            # for last batch, follow process used with gradient accumulation
+                            inputs["update_avg"] = True
+                            inputs["batch_group_loss"] = accumulated_group_loss
+                            tr_loss_step, group_loss, batch_logits = self.training_step(model, inputs)
+
+                            # Gradient clipping
+                            if args.max_grad_norm is not None and args.max_grad_norm > 0 and not self.deepspeed:
+                                # deepspeed does its own clipping
+
+                                if self.do_grad_scaling:
+                                    # Reduce gradients first for XLA
+                                    if is_torch_tpu_available():
+                                        gradients = xm._fetch_gradients(self.optimizer)
+                                        xm.all_reduce("sum", gradients, scale=1.0 / xm.xrt_world_size())
+                                    # AMP: gradients need unscaling
+                                    self.scaler.unscale_(self.optimizer)
+
+                                if hasattr(self.optimizer, "clip_grad_norm"):
+                                    # Some optimizers (like the sharded optimizer) have a specific way to do gradient clipping
+                                    self.optimizer.clip_grad_norm(args.max_grad_norm)
+                                elif hasattr(model, "clip_grad_norm_"):
+                                    # Some models (like FullyShardedDDP) have a specific way to do gradient clipping
+                                    model.clip_grad_norm_(args.max_grad_norm)
+                                else:
+                                    # Revert to normal clipping otherwise, handling Apex or full precision
+                                    nn.utils.clip_grad_norm_(
+                                        amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
+                                        args.max_grad_norm,
+                                    )
+
+                            # Optimizer step
+                            optimizer_was_run = True
+                            if self.deepspeed:
+                                pass  # called outside the loop
+                            elif is_torch_tpu_available():
+                                if self.do_grad_scaling:
+                                    self.scaler.step(self.optimizer)
+                                    self.scaler.update()
+                                else:
+                                    xm.optimizer_step(self.optimizer)
+                            elif self.do_grad_scaling:
+                                scale_before = self.scaler.get_scale()
+                                self.scaler.step(self.optimizer)
+                                self.scaler.update()
+                                scale_after = self.scaler.get_scale()
+                                optimizer_was_run = scale_before <= scale_after
+                            else:
+                                self.optimizer.step()
+
+                            if optimizer_was_run and not self.deepspeed:
+                                self.lr_scheduler.step()
+
+                            model.zero_grad()
+                            self.state.global_step += 1
+                            self.state.epoch = epoch + (step + 1) / steps_in_epoch
+                            self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+
+                            _ = self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval, evaluate=False)
+                            if self.dro_args.is_robust and self.state.global_step % self.args.logging_steps == 0:
+                                self.train_loss_computer.log_stats(logger, True)
+                                self.log(self.train_loss_computer.get_stats(model, args))
+                                iteration_list.append(step)
+                                epoch_list.append(epoch)
+                                group_assignment_list.append(list(self.train_loss_computer.adv_probs.cpu().numpy()))
+                                group_loss_list.append(list(self.train_loss_computer.group_loss.detach().cpu().numpy()))
                         else:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            nn.utils.clip_grad_norm_(
-                                amp.master_params(self.optimizer) if self.use_apex else model.parameters(),
-                                args.max_grad_norm,
-                            )
+                            # For all batches except last one, follow process used without gradient accumulation
+                            # if args.local_rank != -1 and args._no_sync_in_gradient_accumulation:
+                            # with model.no_sync():
+                            tr_loss_step, group_loss, batch_logits = self.training_step(model, inputs)
+                            accumulated_group_loss += group_loss
+                            self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
-                    # Optimizer step
-                    optimizer_was_run = True
-                    if self.deepspeed:
-                        pass  # called outside the loop
-                    elif is_torch_tpu_available():
-                        if self.do_grad_scaling:
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
+                        if train_logits is None:  # Keep track of training dynamics.
+                            train_ids = train_ids_batch
+                            train_logits = batch_logits[0].detach().cpu().numpy()
+                            train_golds = inputs["labels"].detach().cpu().numpy()
+                            # TODO: Check dimension of loss, also does it make sense to detach before optimization.
+                            train_losses = tr_loss_step.cpu().numpy()
                         else:
-                            xm.optimizer_step(self.optimizer)
-                    elif self.do_grad_scaling:
-                        scale_before = self.scaler.get_scale()
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        scale_after = self.scaler.get_scale()
-                        optimizer_was_run = scale_before <= scale_after
-                    else:
-                        self.optimizer.step()
+                            train_ids = np.append(train_ids, train_ids_batch)
+                            train_logits = np.append(train_logits, batch_logits[0].detach().cpu().numpy(), axis=0)
+                            train_golds = np.append(train_golds, inputs["labels"].detach().cpu().numpy())
+                            train_losses = np.append(train_losses, tr_loss_step.cpu().numpy())
 
-                    if optimizer_was_run and not self.deepspeed:
-                        self.lr_scheduler.step()
+                        if self.control.should_epoch_stop or self.control.should_training_stop:
+                            break
 
-                    model.zero_grad()
-                    self.state.global_step += 1
-                    self.state.epoch = epoch + (step + 1) / steps_in_epoch
-                    self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                        if (
+                            args.logging_nan_inf_filter
+                            and not is_torch_tpu_available()
+                            and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                        ):
+                            # if loss is nan or inf simply add the average of previous logged losses
+                            tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
+                        else:
+                            tr_loss += tr_loss_step
 
-                    # Just log, and save checkpoints, dont evaluate.
-                    _ = self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval, evaluate=False)
-                    if self.dro_args.is_robust and self.state.global_step % self.args.logging_steps == 0:
-                        self.train_loss_computer.log_stats(logger, True)
-                        self.log(self.train_loss_computer.get_stats(model, args))
-                        iteration_list.append(step)
-                        epoch_list.append(epoch)
-                        group_assignment_list.append(list(self.train_loss_computer.adv_probs.cpu().numpy()))
-                        group_loss_list.append(list(self.train_loss_computer.group_loss.detach().cpu().numpy()))
-                        # there is a mismatch between Chunting's code where reset happens only after 1 epoch. 
-                        # self.train_loss_computer.reset_stats()
-                        
+                        self.current_flos += float(self.floating_point_ops(inputs))                        
+
+                    mega_batches = []
+                    accumulated_group_loss = self._prepare_input(torch.zeros(self.train_loss_computer.n_groups).float())
                 else:
-                    self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+                    mega_batches.append(inputs)
+                    continue
 
-                if self.control.should_epoch_stop or self.control.should_training_stop:
-                    break
 
             # End of epoch, reset train loss computer.
             if self.dro_args.is_robust and self.train_loss_computer.batch_count > 0:
@@ -2247,11 +2247,20 @@ class TrainerDro:
             groups = inputs["group"]
             group_distributions = inputs.get("group_distribution", None)
             instance_weights = inputs.get("instance_weight", None)
+            group_counts = inputs.get("group_counts", None)
+            update_avg = inputs.get("update_avg", None)
+            batch_group_loss = inputs.get("batch_group_loss", None)
             del inputs["group"]
             if group_distributions is not None:
                 del inputs["group_distribution"]
             if instance_weights is not None:
                 del inputs["instance_weight"]
+            if group_counts is not None:
+                del inputs["group_counts"]
+            if update_avg is not None:
+                del inputs["update_avg"]
+            if batch_group_loss is not None:
+                del inputs["batch_group_loss"]
             loss, outputs = self.compute_loss(model, inputs, return_outputs=True) #return outputs in addition to loss, to record logits.
             # loss on inividual elements of batch
             if self.dro_args.is_robust:
@@ -2259,7 +2268,7 @@ class TrainerDro:
                 yhat = outputs[1]
                 if torch.isnan(loss).any():
                     import pdb; pdb.set_trace()
-                loss = self.train_loss_computer.loss(loss, yhat, y, groups, group_distributions, instance_weights, is_training=True)
+                loss, group_loss = self.train_loss_computer.loss(loss, yhat, y, groups, group_distributions, instance_weights,  batch_group_loss, group_counts, update_avg, is_training=True)
             else:
                 loss = loss.mean() # reduce the loss here.
 
@@ -2289,7 +2298,7 @@ class TrainerDro:
         else:
             loss.backward()
 
-        return loss.detach(), logits
+        return loss.detach(), group_loss.detach(), logits
 
     def compute_loss(self, model, inputs, return_outputs=False):
         """

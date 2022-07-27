@@ -607,7 +607,6 @@ def main():
         logger.info("***** Dumping group assingments for {0} to file *****".format(split))
         pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "error_aware_output_{0}_slices.pkl".format(data_args.n_slices)))
 
-
     if data_args.cluster_all_features:
         id_to_label = {v:k for k,v in label_to_id.items()}
         split = "dev"

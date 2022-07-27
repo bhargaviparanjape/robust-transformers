@@ -27,6 +27,7 @@ import numpy as np
 from datasets import load_dataset, load_metric
 import meerkat as mk
 import pandas as pd
+import json
 
 import torch
 import transformers
@@ -49,6 +50,7 @@ from transformers.trainer_pt_utils import nested_numpify, nested_detach
 from transformers.utils import check_min_version
 from transformers.utils.versions import require_version
 from domino_slicer import DominoMixture, DominoSlicer
+
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +102,14 @@ class DataTrainingArguments:
     )
     dataset_config_name: Optional[str] = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    )
+    cluster_assgn_file: str = field(
+        default=None,
+        metadata={"help": "Path to error-aware cluster assignment file."}
+    )
+    output_file: str = field(
+        default=None,
+        metadata={"help": "output file to store newly re-grouped data."}
     )
     max_seq_length: int = field(
         default=128,
@@ -154,6 +164,9 @@ class DataTrainingArguments:
     )
     cluster_train_features: Optional[bool] = field(
         default=False, metadata={"help": "Cluster training and evaluation data features."}
+    )
+    assign_dev_groups: Optional[bool] = field(
+        default=False, metadata={"help": "Greedily Assign groups based on DOMINO membership."}
     )
     n_slices: Optional[int] = field(default=10, metadata={"help": "number of error slices to analyze."})
     n_mixture_components: Optional[int] = field(default=50, metadata={"help": "number of mixture components."})
@@ -513,24 +526,26 @@ def main():
             # Only look at slices that are actually erroneous
             if not np.argmax(pd_df.iloc[i]["pred_probs"]) == pd_df.iloc[i]["target"]:
                 slices_dict[chosen_slice].append(ex)
-        with open(os.path.join(training_args.output_dir, "clustering", "{0}_analysis_{1}_slices.txt".format(split, data_args.n_slices)), "w") as fout:
+        with open(os.path.join(training_args.output_dir, "clustering", "{0}_analysis_{1}_slices.json".format(split, data_args.n_slices)), "w") as fout:
             # ignore all examples that were assigned slice -1
             for i in range(data_args.n_slices):
-                fout.write("Slice {0}\n".format(i))
+                # fout.write("Slice {0}\n".format(i))
                 for j, ex in enumerate(slices_dict[i]):
                     if data_args.custom_task_name == "mnli_resplit":
-                        fout.write(str(j+1) + "\nPremise:" + ex["sentence1"] + "\nHypothesis:" + ex["sentence2"] + "\nGold:" + ex["label"] +  "\nPrediction:" + ex["prediction"] + "\n")
-                    elif data_args.custom_task_name == "wanli":
-                        fout.write(str(j+1) + "\nPremise:" + ex["premise"] + "\nHypothesis:" + ex["hypothesis"] + "\nGold:" + ex["label"] +  "\nPrediction:" + ex["prediction"] + "\n")
-                    elif data_args.custom_task_name == "wilds_civil_comments":
-                        fout.write(str(j+1) + "\Comment:" + ex["sentence1"] + "\nGold:" + ex["label"] +  "\nPrediction:" + ex["prediction"] + "\n")
-                    elif data_args.custom_task_name == "commonsenseqa":
-                        fout.write(str(j+1) + "\n" + ex["sentence1"] + "\n" + ex["sentence2"] + "\nGold:" + str(ex["label"]) +  "\nPrediction:" + str(ex["prediction"]) + "\n")
-                    elif data_args.custom_task_name == "sst2":
-                        fout.write(str(j+1) + "\nReview:" + ex["sentence"] + "\nGold:" + str(ex["label"]) +  "\nPrediction:" + str(ex["prediction"]) + "\n")
-                    elif data_args.custom_task_name == "qqp":
-                        fout.write(str(j+1) + "\nQuestion1:" + ex["question1"] + "\nQuestion2:" + ex["question2"] + "\nGold:" + str(ex["label"]) +  "\nPrediction:" + str(ex["prediction"]) + "\n")
-                fout.write("\n\n\n")
+                        new_ex = {"slice": i, "premise": ex["sentence1"], "hypothesis": ex["sentence2"], "label": ex["label"], "predicted": ex["prediction"]}
+                    # if data_args.custom_task_name == "mnli_resplit":
+                    #     fout.write(str(j+1) + "\nPremise:" + ex["sentence1"] + "\nHypothesis:" + ex["sentence2"] + "\nGold:" + ex["label"] +  "\nPrediction:" + ex["prediction"] + "\n")
+                    # elif data_args.custom_task_name == "wanli":
+                    #     fout.write(str(j+1) + "\nPremise:" + ex["premise"] + "\nHypothesis:" + ex["hypothesis"] + "\nGold:" + ex["label"] +  "\nPrediction:" + ex["prediction"] + "\n")
+                    # elif data_args.custom_task_name == "wilds_civil_comments":
+                    #     fout.write(str(j+1) + "\Comment:" + ex["sentence1"] + "\nGold:" + ex["label"] +  "\nPrediction:" + ex["prediction"] + "\n")
+                    # elif data_args.custom_task_name == "commonsenseqa":
+                    #     fout.write(str(j+1) + "\n" + ex["sentence1"] + "\n" + ex["sentence2"] + "\nGold:" + str(ex["label"]) +  "\nPrediction:" + str(ex["prediction"]) + "\n")
+                    # elif data_args.custom_task_name == "sst2":
+                    #     fout.write(str(j+1) + "\nReview:" + ex["sentence"] + "\nGold:" + str(ex["label"]) +  "\nPrediction:" + str(ex["prediction"]) + "\n")
+                    # elif data_args.custom_task_name == "qqp":
+                    #     fout.write(str(j+1) + "\nQuestion1:" + ex["question1"] + "\nQuestion2:" + ex["question2"] + "\nGold:" + str(ex["label"]) +  "\nPrediction:" + str(ex["prediction"]) + "\n")
+                    fout.write(json.dumps(new_ex) + "\n")
         for i in range(-1, data_args.n_slices):
             print(len(slices_dict[i]))
 
@@ -556,6 +571,34 @@ def main():
         pd_df.to_pickle(os.path.join(training_args.output_dir, "clustering", "{0}_output_{1}_slices.pkl".format(split, data_args.n_slices)))
         train_slices = np.stack(pd_df["domino_slices"].to_numpy())
         '''
+
+    if data_args.assign_dev_groups:
+        pd_df = pd.read_pickle(data_args.cluster_assgn_file)
+        slices =  np.stack(pd_df["domino_slices"].to_numpy())
+        # greedily assign the slice with highest probability.
+        group_assignment = {}
+        group_distributions = {}
+        for i in range(len(pd_df)):
+            ## Usually analysis is done with group assignment only if value is above a threshold.
+            slice = int(np.argmax(pd_df.iloc[i]["domino_slices"]))
+            slice_val = np.max(pd_df.iloc[i]["domino_slices"])
+            chosen_slice = slice
+            guid = pd_df.iloc[i]["guid"]
+            group_distributions[guid] = list(pd_df.iloc[i]["domino_slices"])
+            group_assignment[guid] = chosen_slice
+        
+        dataset = [json.loads(line) for line in open(data_args.validation_file)]
+        split_by_label = False
+        with open(data_args.output_file, "w") as fout:
+            for ex in dataset:
+                guid = ex["guid"]
+                new_ex = ex
+                if split_by_label:
+                    new_ex["group"] = 3*((group_assignment[guid])) + label_to_id[ex["label"]]
+                else:
+                    new_ex["group"] = group_assignment[guid]
+                new_ex["group_distribution"] = group_distributions[guid]
+                fout.write(json.dumps(new_ex) + "\n")
 
     if data_args.cluster_train_features:
         id_to_label = {v:k for k,v in label_to_id.items()}

@@ -1,3 +1,4 @@
+from curses import meta
 import os
 import torch
 import torch.nn as nn
@@ -28,6 +29,7 @@ class DroArguments:
     n_groups: int = field(default=0, metadata={"help": "Number of groups."})
     group_counts: list = field(default=None, metadata={"help": "List of group counts in training data"})
     group_str: str = field(default="", metadata={"help": "Group Str"})
+    max_var_weight: str = field(default=1.0, metadata={"help": "Hyperparameter for Greedy DRO Adversary."})
 
     """
     Arguments pertaining to Common Gradient Descent Robustness Optimization.
