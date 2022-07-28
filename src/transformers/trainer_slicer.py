@@ -125,7 +125,6 @@ from .training_args import OptimizerNames, ParallelMode, TrainingArguments
 from .utils import logging
 
 from .dro_loss import LossComputer, DroArguments
-from .gcdro_loss import GCDROLossComputer
 
 _is_native_amp_available = False
 
@@ -299,6 +298,7 @@ class TrainerSlicer(Trainer):
         self._memory_tracker.stop_and_update_metrics()
 
         self.dro_args = dro_args
+        self._add_columns()
 
 
     def add_callback(self, callback):
@@ -672,11 +672,42 @@ class TrainerSlicer(Trainer):
                 self.control.should_training_stop = True
             
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
+
+            # this is going to save but only after its worst accuracy has been computed.
             metrics = self._maybe_log_save_evaluate(tr_loss_primary, model, trial, epoch, ignore_keys_for_eval, evaluate=True)
+
+            # Training stopping criterion
+            become_better = False
+            if self.dro_args.is_robust and args.metric_for_best_model == "eval_worst_accuracy":
+                resplit_train_epoch += 1
+                valid_group_acc = [(int(key.lstrip("eval_group_accuracy_")), metrics[key]) for key in metrics.keys() if key.startswith("eval_group_accuracy")]
+                curr_worst_valid_acc = min([acc for _, acc in valid_group_acc])
+                sorted_by_group_id = sorted(valid_group_acc, key=lambda tup: tup[0])
+                group_acc = " ".join(["%d: %.3f" % (idx, acc if acc > 0 else -acc) for idx, acc in sorted_by_group_id])
+                become_better = (worst_valid_acc is not None and curr_worst_valid_acc > worst_valid_acc) or worst_valid_acc is None
+                worst_valid_acc = curr_worst_valid_acc if worst_valid_acc is None else max(curr_worst_valid_acc, worst_valid_acc)
+                bad_counts = 0 if become_better else bad_counts + 1
+
+                logger.info("Valid group performance: {}".format(group_acc))
+                logger.info("Better worst valid = {}, bad counts = {}, worst acc = {}".format(become_better, bad_counts, curr_worst_valid_acc))
+                # Update metrics (best_worst_group)
+                metrics["eval_worst_accuracy"] = worst_valid_acc
+            else:
+                # Even with robust training, this code will get triggered.
+                current_valid_acc = metrics["eval_accuracy"]
+                become_better = (valid_acc is not None  and current_valid_acc > valid_acc) or valid_acc is None
+                valid_acc = current_valid_acc if valid_acc is None else max(current_valid_acc, valid_acc)
+                bad_counts = 0 if become_better else bad_counts + 1
+                logger.info("Valid performance: {}".format(current_valid_acc))
+                logger.info("Better valid = {}, bad counts = {}, best acc = {}".format(become_better, bad_counts, current_valid_acc))
+
+            # Model selection (save checkpoint with best worst_accuracy as the "best_" checkpoint)
+            if become_better:
+                # First time worst_accuracy is computed, or worst accuracy improved.
+                self._save_checkpoint(model, trial, metrics=metrics, save_best=True)
 
             if self.control.should_training_stop:
                 break
-
         
         # End of training
 
@@ -777,6 +808,153 @@ class TrainerSlicer(Trainer):
         
         return metrics
 
+
+    def _sorted_checkpoints(
+        self, output_dir=None, checkpoint_prefix=PREFIX_CHECKPOINT_DIR, use_mtime=False
+    ) -> List[str]:
+        ordering_and_checkpoint_path = []
+
+        glob_checkpoints = [str(x) for x in Path(output_dir).glob(f"{checkpoint_prefix}-*")]
+
+        for path in glob_checkpoints:
+            if use_mtime:
+                ordering_and_checkpoint_path.append((os.path.getmtime(path), path))
+            else:
+                regex_match = re.match(f".*{checkpoint_prefix}-([0-9]+)", path)
+                if regex_match is not None and regex_match.groups() is not None:
+                    ordering_and_checkpoint_path.append((int(regex_match.groups()[0]), path))
+
+        checkpoints_sorted = sorted(ordering_and_checkpoint_path)
+        checkpoints_sorted = [checkpoint[1] for checkpoint in checkpoints_sorted]
+        # Make sure we don't delete the best model.
+        if self.state.best_model_checkpoint is not None:
+            if "best" in self.state.best_model_checkpoint:
+                # no need to remove any checkpoint from list, since best checkpoint is being explicitly saved.
+                return checkpoints_sorted
+            best_model_index = checkpoints_sorted.index(str(Path(self.state.best_model_checkpoint)))
+            for i in range(best_model_index, len(checkpoints_sorted) - 2):
+                checkpoints_sorted[i], checkpoints_sorted[i + 1] = checkpoints_sorted[i + 1], checkpoints_sorted[i]
+        return checkpoints_sorted
+
+
+    def _save_checkpoint(self, model, trial, metrics=None, save_best=False):
+        # In all cases, including ddp/dp/deepspeed, self.model is always a reference to the model we
+        # want to save except FullyShardedDDP.
+        # assert unwrap_model(model) is self.model, "internal model should be a reference to self.model"
+
+        # Save model checkpoint
+        if save_best:
+            checkpoint_folder = f"best_checkpoint"
+        else:
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+
+        if self.hp_search_backend is not None and trial is not None:
+            if self.hp_search_backend == HPSearchBackend.OPTUNA:
+                run_id = trial.number
+            elif self.hp_search_backend == HPSearchBackend.RAY:
+                from ray import tune
+
+                run_id = tune.get_trial_id()
+            elif self.hp_search_backend == HPSearchBackend.SIGOPT:
+                run_id = trial.id
+            elif self.hp_search_backend == HPSearchBackend.WANDB:
+                import wandb
+
+                run_id = wandb.run.id
+            run_name = self.hp_name(trial) if self.hp_name is not None else f"run-{run_id}"
+            run_dir = os.path.join(self.args.output_dir, run_name)
+        else:
+            run_dir = self.args.output_dir
+            self.store_flos()
+
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+        self.save_model(output_dir, _internal_call=True)
+        if self.deepspeed:
+            # under zero3 model file itself doesn't get saved since it's bogus! Unless deepspeed
+            # config `stage3_gather_fp16_weights_on_model_save` is True
+            self.deepspeed.save_checkpoint(output_dir)
+
+        # Save optimizer and scheduler
+        if self.sharded_ddp == ShardedDDPOption.SIMPLE:
+            self.optimizer.consolidate_state_dict()
+
+        if is_torch_tpu_available():
+            xm.rendezvous("saving_optimizer_states")
+            xm.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                xm.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+                reissue_pt_warnings(caught_warnings)
+        elif is_sagemaker_mp_enabled():
+            if smp.rdp_rank() == 0:
+                # Consolidate the state dict on all processed of rdp_rank 0
+                opt_state_dict = self.optimizer.state_dict()
+                # Save it and the scheduler on the main process
+                if self.args.should_save:
+                    torch.save(opt_state_dict, os.path.join(output_dir, OPTIMIZER_NAME))
+                    with warnings.catch_warnings(record=True) as caught_warnings:
+                        torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+                    reissue_pt_warnings(caught_warnings)
+                    if self.do_grad_scaling:
+                        torch.save(self.scaler.state_dict(), os.path.join(output_dir, SCALER_NAME))
+        elif self.args.should_save and not self.deepspeed:
+            # deepspeed.save_checkpoint above saves model/optim/sched
+            torch.save(self.optimizer.state_dict(), os.path.join(output_dir, OPTIMIZER_NAME))
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+            reissue_pt_warnings(caught_warnings)
+            if self.do_grad_scaling:
+                torch.save(self.scaler.state_dict(), os.path.join(output_dir, SCALER_NAME))
+
+        # Determine the new best metric / best model checkpoint
+        if metrics is not None and self.args.metric_for_best_model is not None:
+            metric_to_check = self.args.metric_for_best_model
+            if not metric_to_check.startswith("eval_"):
+                metric_to_check = f"eval_{metric_to_check}"
+            metric_value = metrics[metric_to_check]
+
+            operator = np.greater if self.args.greater_is_better else np.less
+            if (
+                self.state.best_metric is None
+                or self.state.best_model_checkpoint is None
+                or operator(metric_value, self.state.best_metric)
+            ):
+                self.state.best_metric = metric_value
+                self.state.best_model_checkpoint = output_dir
+
+        # Save the Trainer state
+        if self.args.should_save:
+            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+
+        # Save RNG state in non-distributed training
+        rng_states = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "cpu": torch.random.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            if self.args.local_rank == -1:
+                # In non distributed, we save the global CUDA RNG state (will take care of DataParallel)
+                rng_states["cuda"] = torch.cuda.random.get_rng_state_all()
+            else:
+                rng_states["cuda"] = torch.cuda.random.get_rng_state()
+
+        if is_torch_tpu_available():
+            rng_states["xla"] = xm.get_rng_state()
+
+        # A process can arrive here before the process 0 has a chance to save the model, in which case output_dir may
+        # not yet exist.
+        os.makedirs(output_dir, exist_ok=True)
+        local_rank = xm.get_local_ordinal() if is_torch_tpu_available() else self.args.local_rank
+        if local_rank == -1:
+            torch.save(rng_states, os.path.join(output_dir, "rng_state.pth"))
+        else:
+            torch.save(rng_states, os.path.join(output_dir, f"rng_state_{local_rank}.pth"))
+
+        # Maybe delete some older checkpoints.
+        if self.args.should_save:
+            self._rotate_checkpoints(use_mtime=True, output_dir=run_dir)
+    
+
     def _remove_unused_columns(self, dataset: "datasets.Dataset", description: Optional[str] = None):
         if not self.args.remove_unused_columns:
             return dataset
@@ -816,7 +994,7 @@ class TrainerSlicer(Trainer):
         epoch = 0
         # Check if evaluating.
         if self.train_dataset is not None:
-            instance_weights = self.train_loss_computer.compute_beta_cover(seed, epoch, self.train_dataset)
+            instance_weights = self.model.compute_beta_cover(seed, epoch, self.train_dataset)
             self.train_dataset = self.train_dataset.add_column("instance_weight", instance_weights)
 
     def _update_columns(self, epoch):
@@ -846,7 +1024,9 @@ class TrainerSlicer(Trainer):
                     del inputs["group_distribution"]
                 if instance_weights is not None:
                     del inputs["instance_weight"]
-                loss, _ = self.compute_loss(model, inputs, return_outputs=True)
+                del inputs["guid"]
+                outputs = model.task_model(**inputs)
+                loss, _ = outputs[0], outputs[1]
                 if train_losses is None:
                     train_losses = loss.detach().cpu().numpy()
                 else:
@@ -1169,6 +1349,7 @@ class TrainerSlicer(Trainer):
         if is_datasets_available() and isinstance(eval_dataset, datasets.Dataset):
             eval_dataset = self._remove_unused_columns(eval_dataset, description="evaluation")
         
+        """
         eval_feature_list = []
         for id_, ex in enumerate(eval_dataset):
             guid = ex["guid"]
@@ -1180,6 +1361,7 @@ class TrainerSlicer(Trainer):
             # Add other features : Dynamics, perturbed features etc...
 
         eval_dataset = eval_dataset.add_column("group_features", eval_feature_list)
+        """
 
         if isinstance(eval_dataset, torch.utils.data.IterableDataset):
             if self.args.world_size > 1:
@@ -1209,6 +1391,303 @@ class TrainerSlicer(Trainer):
             num_workers=self.args.dataloader_num_workers,
             pin_memory=self.args.dataloader_pin_memory,
         )
+
+
+    def evaluate(
+        self,
+        eval_dataset: Optional[Dataset] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        """
+        Run evaluation and returns metrics.
+
+        The calling script will be responsible for providing a method to compute metrics, as they are task-dependent
+        (pass it to the init `compute_metrics` argument).
+
+        You can also subclass and override this method to inject custom behavior.
+
+        Args:
+            eval_dataset (`Dataset`, *optional*):
+                Pass a dataset if you wish to override `self.eval_dataset`. If it is an `datasets.Dataset`, columns not
+                accepted by the `model.forward()` method are automatically removed. It must implement the `__len__`
+                method.
+            ignore_keys (`Lst[str]`, *optional*):
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions.
+            metric_key_prefix (`str`, *optional*, defaults to `"eval"`):
+                An optional prefix to be used as the metrics key prefix. For example the metrics "bleu" will be named
+                "eval_bleu" if the prefix is "eval" (default)
+
+        Returns:
+            A dictionary containing the evaluation loss and the potential metrics computed from the predictions. The
+            dictionary also contains the epoch number which comes from the training state.
+        """
+        # memory metrics - must set up as early as possible
+        self._memory_tracker.start()
+
+        eval_dataloader = self.get_eval_dataloader(self.eval_dataset)
+        start_time = time.time()
+
+        # Declare an evaluation loss computer object.
+        if self.dro_args.is_robust:
+            if not self.dro_args.use_group_weights:
+                group_list = [ex["group"] for ex in self.eval_dataset]
+                unique_groups, group_counts = np.unique(group_list, return_counts=True)
+                n_groups = len(unique_groups)
+                group_counts = torch.LongTensor(group_counts)
+            else:
+                group_distributions = np.asarray([ex["group_distribution"] for ex in self.eval_dataset])
+                group_list = np.argmax(group_distributions, axis=1)
+                unique_groups, group_counts = np.unique(group_list, return_counts=True)
+                n_groups = len(unique_groups)
+                group_counts = torch.LongTensor(group_counts)
+                
+            self.val_loss_computer = LossComputer(
+                dro_args=self.dro_args,
+                training_args=self.args,
+                # dataset=dataset['train_data'], ## Why is this needed? to compute n_groups, group_counts which are passed as arguments now.
+                n_groups=n_groups,
+                group_counts=group_counts)
+                # adj=adjustments)
+
+
+        eval_loop = self.prediction_loop if self.args.use_legacy_prediction_loop else self.evaluation_loop
+        output = eval_loop(
+            eval_dataloader,
+            description="Evaluation",
+            # No point gathering the predictions if there are no metrics, otherwise we defer to
+            # self.args.prediction_loss_only
+            prediction_loss_only=True if self.compute_metrics is None else None,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+
+        # Print stats after evaluation loop complete.
+        # if self.dro_args.is_robust: 
+        #     self.val_loss_computer.log_stats(logger, True)
+        #     self.log(self.val_loss_computer.get_stats(self.model, self.args))
+        """
+        if self.dro_args.is_robust and self.dro_args.automatic_adjustment:
+            gen_gap = self.val_loss_computer.avg_group_loss - self.train_loss_computer.exp_avg_loss
+            adjustments = gen_gap * torch.sqrt(self.train_loss_computer.group_counts)
+            self.train_loss_computer.adj = adjustments
+            logger.info('Adjustments updated\n')
+            for group_idx in range(self.train_loss_computer.n_groups):
+                logger.info(
+                    f'  {group_idx}:\t'
+                    f'adj = {self.train_loss_computer.adj[group_idx]:.3f}\n')
+        """
+
+        total_batch_size = self.args.eval_batch_size * self.args.world_size
+        output.metrics.update(
+            speed_metrics(
+                metric_key_prefix,
+                start_time,
+                num_samples=output.num_samples,
+                num_steps=math.ceil(output.num_samples / total_batch_size),
+            )
+        )
+
+        self.log(output.metrics)
+
+        if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
+            # tpu-comment: Logging debug metrics for PyTorch/XLA (compile, execute times, ops, etc.)
+            xm.master_print(met.metrics_report())
+
+        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, output.metrics)
+
+        self._memory_tracker.stop_and_update_metrics(output.metrics)
+
+        return output.metrics
+
+    def evaluation_loop(
+        self,
+        dataloader: DataLoader,
+        description: str,
+        prediction_loss_only: Optional[bool] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> EvalLoopOutput:
+        """
+        Prediction/evaluation loop, shared by `Trainer.evaluate()` and `Trainer.predict()`.
+
+        Works both with or without labels.
+        """
+        args = self.args
+
+        prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
+
+        # if eval is called w/o train init deepspeed here
+        if args.deepspeed and not self.deepspeed:
+
+            # XXX: eval doesn't have `resume_from_checkpoint` arg but we should be able to do eval
+            # from the checkpoint eventually
+            deepspeed_engine, _, _ = deepspeed_init(
+                self, num_training_steps=0, resume_from_checkpoint=None, inference=True
+            )
+            self.model = deepspeed_engine.module
+            self.model_wrapped = deepspeed_engine
+            self.deepspeed = deepspeed_engine
+
+        model = self._wrap_model(self.model, training=False)
+
+        # if full fp16 or bf16 eval is wanted and this ``evaluation`` or ``predict`` isn't called
+        # while ``train`` is running, cast it to the right dtype first and then put on device
+        if not self.is_in_train:
+            if args.fp16_full_eval:
+                model = model.to(dtype=torch.float16, device=args.device)
+            elif args.bf16_full_eval:
+                model = model.to(dtype=torch.bfloat16, device=args.device)
+
+        batch_size = dataloader.batch_size
+
+        logger.info(f"***** Running {description} *****")
+        if has_length(dataloader.dataset):
+            logger.info(f"  Num examples = {self.num_examples(dataloader)}")
+        else:
+            logger.info("  Num examples: Unknown")
+        logger.info(f"  Batch size = {batch_size}")
+
+        model.eval()
+
+        self.callback_handler.eval_dataloader = dataloader
+        # Do this before wrapping.
+        eval_dataset = dataloader.dataset
+
+        if is_torch_tpu_available():
+            dataloader = pl.ParallelLoader(dataloader, [args.device]).per_device_loader(args.device)
+
+        if args.past_index >= 0:
+            self._past = None
+
+        # Initialize containers
+        # losses/preds/labels on GPU/TPU (accumulated for eval_accumulation_steps)
+        losses_host = None
+        preds_host = None
+        labels_host = None
+        # losses/preds/labels on CPU (final containers)
+        all_losses = None
+        all_preds = None
+        all_labels = None
+        # Will be useful when we have an iterable dataset so don't know its length.
+
+        observed_num_examples = 0
+        # Main evaluation loop
+        for step, inputs in enumerate(dataloader):
+            # Update the observed num examples
+            observed_batch_size = find_batch_size(inputs)
+            if observed_batch_size is not None:
+                observed_num_examples += observed_batch_size
+                # For batch samplers, batch_size is not known by the dataloader in advance.
+                if batch_size is None:
+                    batch_size = observed_batch_size
+
+            # Prediction step
+            # TODO(bparan): Inputs needs to be stripped of non-tensor metadata to be sent to model forward function.
+            # Metadata information can be used to either log model performance, or provide group information. 
+            # del inputs["guid"]
+            loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+
+
+            if is_torch_tpu_available():
+                xm.mark_step()
+
+            # Update containers on host
+            if loss is not None:
+                losses = self._nested_gather(loss.repeat(batch_size))
+                losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
+            if labels is not None:
+                labels = self._pad_across_processes(labels)
+                labels = self._nested_gather(labels)
+                labels_host = labels if labels_host is None else nested_concat(labels_host, labels, padding_index=-100)
+            if logits is not None:
+                logits = self._pad_across_processes(logits)
+                logits = self._nested_gather(logits)
+                if self.preprocess_logits_for_metrics is not None:
+                    logits = self.preprocess_logits_for_metrics(logits, labels)
+                preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+            self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
+
+            # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
+            if args.eval_accumulation_steps is not None and (step + 1) % args.eval_accumulation_steps == 0:
+                if losses_host is not None:
+                    losses = nested_numpify(losses_host)
+                    all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
+                if preds_host is not None:
+                    logits = nested_numpify(preds_host)
+                    all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+                if labels_host is not None:
+                    labels = nested_numpify(labels_host)
+                    all_labels = (
+                        labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+                    )
+
+                # Set back to None to begin a new accumulation
+                losses_host, preds_host, labels_host = None, None, None
+
+        if args.past_index and hasattr(self, "_past"):
+            # Clean the state at the end of the evaluation loop
+            delattr(self, "_past")
+
+        # Gather all remaining tensors and put them back on the CPU
+        if losses_host is not None:
+            losses = nested_numpify(losses_host)
+            all_losses = losses if all_losses is None else np.concatenate((all_losses, losses), axis=0)
+        if preds_host is not None:
+            logits = nested_numpify(preds_host)
+            all_preds = logits if all_preds is None else nested_concat(all_preds, logits, padding_index=-100)
+        if labels_host is not None:
+            labels = nested_numpify(labels_host)
+            all_labels = labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+
+        # Number of samples
+        if has_length(eval_dataset):
+            num_samples = len(eval_dataset)
+        # The instance check is weird and does not actually check for the type, but whether the dataset has the right
+        # methods. Therefore we need to make sure it also has the attribute.
+        elif isinstance(eval_dataset, IterableDatasetShard) and hasattr(eval_dataset, "num_examples"):
+            num_samples = eval_dataset.num_examples
+        else:
+            num_samples = observed_num_examples
+
+        # Number of losses has been rounded to a multiple of batch_size and in a distributed training, the number of
+        # samplers has been rounded to a multiple of batch_size, so we truncate.
+        if all_losses is not None:
+            all_losses = all_losses[:num_samples]
+        if all_preds is not None:
+            all_preds = nested_truncate(all_preds, num_samples)
+        if all_labels is not None:
+            all_labels = nested_truncate(all_labels, num_samples)
+
+        # Metrics!
+        if self.compute_metrics is not None and all_preds is not None and all_labels is not None:
+            metrics = self.compute_metrics(EvalPrediction(predictions=all_preds, label_ids=all_labels))
+        else:
+            metrics = {}
+
+        # Compute Worst Group Metrics, if group information is evailable in the evaluation set.
+        if hasattr(self, "val_loss_computer"):
+            n_eval_groups = self.val_loss_computer.n_groups
+            key = "accuracy"
+            # val_loss_computer was not used to actually record loss computation.
+            import pdb; pdb.set_trace()
+            for group_idx in range(n_eval_groups):
+                metrics[f"group_{key}_{group_idx}"] = self.val_loss_computer.avg_group_acc[group_idx]
+
+        # To be JSON-serializable, we need to remove numpy types or zero-d tensors
+        metrics = denumpify_detensorize(metrics)
+
+        if all_losses is not None:
+            metrics[f"{metric_key_prefix}_loss"] = all_losses.mean().item()
+
+        # Prefix all keys with metric_key_prefix + '_'
+        for key in list(metrics.keys()):
+            if not key.startswith(f"{metric_key_prefix}_"):
+                metrics[f"{metric_key_prefix}_{key}"] = metrics.pop(key)
+
+        return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=num_samples)
+
 
     def prediction_step(
         self,
@@ -1282,11 +1761,16 @@ class TrainerSlicer(Trainer):
                         groups = inputs["group"]
                         group_distributions = inputs.get("group_distribution", None)
                         instance_weights = inputs.get("instance_weight", None)
+                        del inputs["group"]
                         if group_distributions is not None:
                             del inputs["group_distribution"]
                         if instance_weights is not None:
                             del inputs["instance_weight"]
-                        loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+                        del inputs["guid"]
+                        # We are also loading eval features.
+                        outputs = model.task_model(**inputs)
+                        #loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+                        loss = outputs[0]
                         # loss on inividual elements of batch
                         loss = loss.mean() # reduce the loss here.
                     loss = loss.mean().detach()
@@ -1300,7 +1784,7 @@ class TrainerSlicer(Trainer):
                     with self.autocast_smart_context_manager():
                         #TODO: Remove non-tensorizable elements from inputs.
                         del inputs["guid"]
-                        del inputs["group"]
+                        #del inputs["group"]
                         if self.dro_args.use_group_weights or "group_distribution" in inputs:
                             del inputs["group_distribution"]
                         if "instance_weight" in inputs:

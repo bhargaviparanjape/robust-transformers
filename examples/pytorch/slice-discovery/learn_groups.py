@@ -460,8 +460,100 @@ def main():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
 
-    # Examine groups
-    
+    # Evaluation
+    if training_args.do_eval:
+        logger.info("*** Evaluate ***")
+
+        # At the end of training, the best model is loaded for evaluation. In case of evaluation called without training, this needs to be done explicitly.
+        if trainer.state.best_model_checkpoint is not None:
+            # Wait for everyone to get here so we are sur the model has been saved by process 0.
+            # if is_torch_tpu_available():
+            #     xm.rendezvous("load_best_model_at_end")
+            # elif args.local_rank != -1:
+            #     dist.barrier()
+            logger.info(
+                f"Loading best model from {trainer.state.best_model_checkpoint} (score: {trainer.state.best_metric})."
+            )
+            best_model_path = os.path.join(trainer.state.best_model_checkpoint, WEIGHTS_NAME)
+            if os.path.exists(best_model_path):
+                # We load the model state dict on the CPU to avoid an OOM error.
+                state_dict = torch.load(best_model_path, map_location="cpu")
+                # If the model is on the GPU, it still works!
+                trainer._load_state_dict_in_model(state_dict)
+            else:
+                logger.warning(
+                    f"Could not locate the best model at {best_model_path}, if you are running a distributed training "
+                    "on multiple nodes, you should activate `--save_on_each_node`."
+                )
+
+        # Loop to handle MNLI double evaluation (matched, mis-matched)
+        tasks = [data_args.task_name]
+        eval_datasets = [eval_dataset]
+        if data_args.task_name == "mnli":
+            tasks.append("mnli-mm")
+            eval_datasets.append(raw_datasets["validation_mismatched"])
+
+        for eval_dataset, task in zip(eval_datasets, tasks):
+            metrics = trainer.evaluate(eval_dataset=eval_dataset)
+
+            max_eval_samples = (
+                data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+            )
+            metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+
+            trainer.log_metrics("eval", metrics)
+            trainer.save_metrics("eval", metrics)
+
+    # Predictions
+    if training_args.do_predict:
+        logger.info("*** Predict ***")
+
+        if trainer.state.best_model_checkpoint is not None:
+            # Wait for everyone to get here so we are sur the model has been saved by process 0.
+            # if is_torch_tpu_available():
+            #     xm.rendezvous("load_best_model_at_end")
+            # elif args.local_rank != -1:
+            #     dist.barrier()
+            logger.info(
+                f"Loading best model from {trainer.state.best_model_checkpoint} (score: {trainer.state.best_metric})."
+            )
+
+            best_model_path = os.path.join(trainer.state.best_model_checkpoint, WEIGHTS_NAME)
+            if os.path.exists(best_model_path):
+                # We load the model state dict on the CPU to avoid an OOM error.
+                state_dict = torch.load(best_model_path, map_location="cpu")
+                # If the model is on the GPU, it still works!
+                trainer._load_state_dict_in_model(state_dict)
+            else:
+                logger.warning(
+                    f"Could not locate the best model at {best_model_path}, if you are running a distributed training "
+                    "on multiple nodes, you should activate `--save_on_each_node`."
+                )
+
+        # Loop to handle MNLI double evaluation (matched, mis-matched)
+        tasks = [data_args.task_name]
+        predict_datasets = [predict_dataset]
+        if data_args.task_name == "mnli":
+            tasks.append("mnli-mm")
+            predict_datasets.append(raw_datasets["test_mismatched"])
+
+        for predict_dataset, task in zip(predict_datasets, tasks):
+            # Removing the `label` columns because it contains -1 and Trainer won't like that.
+            predict_dataset = predict_dataset.remove_columns("label")
+            predictions = trainer.predict(predict_dataset, metric_key_prefix="predict").predictions
+            predictions = np.squeeze(predictions) if is_regression else np.argmax(predictions, axis=1)
+
+            output_predict_file = os.path.join(training_args.output_dir, f"predict_results_{task}.txt")
+            if trainer.is_world_process_zero():
+                with open(output_predict_file, "w") as writer:
+                    logger.info(f"***** Predict results {task} *****")
+                    writer.write("index\tprediction\n")
+                    for index, item in enumerate(predictions):
+                        if is_regression:
+                            writer.write(f"{index}\t{item:3.3f}\n")
+                        else:
+                            item = label_list[item]
+                            writer.write(f"{index}\t{item}\n")
 
 
 if __name__ == "__main__":
