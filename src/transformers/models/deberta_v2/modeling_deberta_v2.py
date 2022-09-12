@@ -19,6 +19,7 @@ from collections.abc import Sequence
 
 import numpy as np
 import torch
+from packaging import version
 from torch import _softmax_backward_data, nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
 
@@ -37,6 +38,7 @@ from .configuration_deberta_v2 import DebertaV2Config
 
 
 logger = logging.get_logger(__name__)
+convert_softmax_tensor_to_dtype = not version.parse(torch.__version__) < version.parse("1.11")
 
 _CONFIG_FOR_DOC = "DebertaV2Config"
 _TOKENIZER_FOR_DOC = "DebertaV2Tokenizer"
@@ -116,7 +118,7 @@ class XSoftmax(torch.autograd.Function):
     @staticmethod
     def backward(self, grad_output):
         (output,) = self.saved_tensors
-        inputGrad = _softmax_backward_data(grad_output, output, self.dim, output)
+        inputGrad = _softmax_backward_data(grad_output, output, self.dim, output.dtype if convert_softmax_tensor_to_dtype else output)
         return inputGrad, None, None
 
     @staticmethod
@@ -1324,7 +1326,7 @@ class DebertaV2ForSequenceClassification(DebertaV2PreTrainedModel):
                             logits, 0, label_index.expand(label_index.size(0), logits.size(1))
                         )
                         labels = torch.gather(labels, 0, label_index.view(-1))
-                        loss_fct = CrossEntropyLoss()
+                        loss_fct = CrossEntropyLoss(reduction='none')
                         loss = loss_fct(labeled_logits.view(-1, self.num_labels).float(), labels.view(-1))
                     else:
                         loss = torch.tensor(0).to(logits)
@@ -1338,7 +1340,7 @@ class DebertaV2ForSequenceClassification(DebertaV2PreTrainedModel):
                 else:
                     loss = loss_fct(logits, labels)
             elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
+                loss_fct = CrossEntropyLoss(reduction='none')
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
             elif self.config.problem_type == "multi_label_classification":
                 loss_fct = BCEWithLogitsLoss()

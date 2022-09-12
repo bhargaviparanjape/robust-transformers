@@ -191,6 +191,11 @@ class FeaturesManager:
         "m2m-100": supported_features_mapping(
             "default", "default-with-past", "seq2seq-lm", "seq2seq-lm-with-past", onnx_config_cls=M2M100OnnxConfig
         ),
+        "resnet": supported_features_mapping(
+            "default",
+            "image-classification",
+            onnx_config_cls="models.resnet.ResNetOnnxConfig",
+        ),
         "roberta": supported_features_mapping(
             "default",
             "masked-lm",

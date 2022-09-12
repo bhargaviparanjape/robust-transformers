@@ -1,6 +1,6 @@
 data=/mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data
-train_dataset=NLI/MNLI/eval_sets/snli_validation.json
-dataset=NLI/MNLI/eval_sets/snli_validation.json
+train_dataset=NLI/MNLI/dev_resplit.json
+dataset=NLI/MNLI/dev_worst.json
 
 
 for dir in ${1}/*/
@@ -14,7 +14,7 @@ done
 
 
 
-output_file=${1}/snli_validation.txt
+output_file=${1}/dev_worst_validation.txt
 rm ${output_file}
 for dir in ${1}/*/
 do

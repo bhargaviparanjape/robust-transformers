@@ -115,6 +115,7 @@ MODEL_MAPPING_NAMES = OrderedDict(
         ("splinter", "SplinterModel"),
         ("sew", "SEWModel"),
         ("sew-d", "SEWDModel"),
+        ("resnet", "ResNetModel"),
     ]
 )
 
@@ -295,6 +296,7 @@ MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES = OrderedDict(
         ("swin", "SwinForImageClassification"),
         ("convnext", "ConvNextForImageClassification"),
         ("poolformer", "PoolFormerForImageClassification"),
+        ("resnet", "ResNetForImageClassification"),
     ]
 )
 

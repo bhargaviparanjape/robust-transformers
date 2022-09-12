@@ -29,8 +29,8 @@ from transformers import (
     EvalPrediction,
     HfArgumentParser,
     PretrainedConfig,
+    DominoTrainingArguments,
     TrainerSlicer,
-    TrainingArguments,
     DroArguments,
     cartography_data_collator,
     set_seed,
@@ -181,8 +181,8 @@ class ModelArguments:
     model_name_or_path: str = field(
         metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
-    adversary_model_name_or_path: str = field(
-        metadata={"help": "Path to pretrained adversary model"}
+    adversary_model_name_or_path: Optional[str] = field(
+        default=None, metadata={"help": "Path to pretrained adversary model"}
     )
     config_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
@@ -221,10 +221,22 @@ class ModelArguments:
             "help": "Number of group assignments to learn."
         }
     )
+    entropy_reg: float = field(
+        default=0.0,
+        metadata={
+            "help": "Use Entropy Regularizer"
+        }
+    )
+    marginal_reg: float = field(
+        default=0.0,
+        metadata={
+            "help": "Use Entropy Regularizer"
+        }
+    )
 
 
 def main():
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, DroArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, DominoTrainingArguments, DroArguments))
     model_args, data_args, training_args, dro_args = parser.parse_args_into_dataclasses()
 
     # Setup logging
@@ -299,6 +311,10 @@ def main():
         use_auth_token=True if model_args.use_auth_token else None,
     )
 
+    # Load external feature files
+    # train_features = pd.read_pickle(os.path.join(data_args.train_feature_file))
+    # eval_features = pd.read_pickle(os.path.join(data_args.validation_feature_file))
+
     # Preprocessing the raw_datasets
     sentence1_key, sentence2_key = custom_task_to_keys[data_args.custom_task_name]
     # Padding strategy
@@ -338,6 +354,8 @@ def main():
         
         result["guid"] = examples["guid"]
         result["group"] = examples["group"]
+        #result["group_features"] = [feature_dict[guid] for guid in examples["guid"]]
+
         return result
 
     with training_args.main_process_first(desc="dataset map pre-processing"):
@@ -412,16 +430,18 @@ def main():
     else:
         data_collator = None
 
-    # Load feature files
-    train_features = pd.read_pickle(os.path.join(data_args.train_feature_file))
-    eval_features = pd.read_pickle(os.path.join(data_args.validation_feature_file))
-
     # Declare model for group prediction, which is enveloped in a Learned DOMINO model
     domino_model = DominoSlicer(model_args, training_args, dro_args, model)
 
     # load a pretrained adversarial grouper model
     if model_args.adversary_model_name_or_path:
         state_dict = torch.load(model_args.adversary_model_name_or_path , map_location="cpu")
+        state_dict_new = OrderedDict({k.replace("grouper_model.", ""):v for k,v in state_dict.items()})
+        domino_model.grouper_model.load_state_dict(state_dict_new)
+
+    # When grouper model is already trained(ie. model_name_or_path is a directory with a grouper model, initialize with it)
+    if os.path.exists(model_args.model_name_or_path) and os.path.exists(os.path.join(model_args.model_name_or_path, "grouper")):
+        state_dict = torch.load(os.path.join(model_args.model_name_or_path, "grouper", "pytorch_model.bin") , map_location="cpu")
         state_dict_new = OrderedDict({k.replace("grouper_model.", ""):v for k,v in state_dict.items()})
         domino_model.grouper_model.load_state_dict(state_dict_new)
 
@@ -434,8 +454,8 @@ def main():
         data_collator=data_collator,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
-        train_features=train_features if training_args.do_train else None,
-        eval_features=eval_features if training_args.do_eval else None, 
+        # train_features=train_features if training_args.do_train else None,
+        # eval_features=eval_features if training_args.do_eval else None, 
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
     )

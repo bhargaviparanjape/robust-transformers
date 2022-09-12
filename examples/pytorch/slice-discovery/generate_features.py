@@ -524,15 +524,15 @@ def main():
             ex = data_dict[guid]
             ex["prediction"] = id_to_label[np.argmax(pd_df.iloc[i]["pred_probs"])]
             # Only look at slices that are actually erroneous
-            if not np.argmax(pd_df.iloc[i]["pred_probs"]) == pd_df.iloc[i]["target"]:
-                slices_dict[chosen_slice].append(ex)
+            # if not np.argmax(pd_df.iloc[i]["pred_probs"]) == pd_df.iloc[i]["target"]:
+            slices_dict[chosen_slice].append(ex)
         with open(os.path.join(training_args.output_dir, "clustering", "{0}_analysis_{1}_slices.json".format(split, data_args.n_slices)), "w") as fout:
             # ignore all examples that were assigned slice -1
             for i in range(data_args.n_slices):
                 # fout.write("Slice {0}\n".format(i))
                 for j, ex in enumerate(slices_dict[i]):
                     if data_args.custom_task_name == "mnli_resplit":
-                        new_ex = {"slice": i, "premise": ex["sentence1"], "hypothesis": ex["sentence2"], "label": ex["label"], "predicted": ex["prediction"]}
+                        new_ex = {"slice": i, "premise": ex["sentence1"], "hypothesis": ex["sentence2"], "label": ex["label"], "predicted": ex["prediction"], "guid": ex["guid"]}
                     # if data_args.custom_task_name == "mnli_resplit":
                     #     fout.write(str(j+1) + "\nPremise:" + ex["sentence1"] + "\nHypothesis:" + ex["sentence2"] + "\nGold:" + ex["label"] +  "\nPrediction:" + ex["prediction"] + "\n")
                     # elif data_args.custom_task_name == "wanli":

@@ -2013,6 +2013,7 @@ class Trainer:
             # loss gets scaled under gradient_accumulation_steps in deepspeed
             loss = self.deepspeed.backward(loss)
         else:
+            loss = loss.mean()
             loss.backward()
 
         return loss.detach()

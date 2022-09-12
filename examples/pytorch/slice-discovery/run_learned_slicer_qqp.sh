@@ -13,7 +13,7 @@
 source ~/.bashrc
 conda activate work
 
-python -m torch.distributed.launch --nproc_per_node=1 learn_groups.py \
+python -m torch.distributed.launch --nproc_per_node=2 learn_groups.py \
     --model_name_or_path /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_erm_deberta_bz128/checkpoint-4000 \
     --custom_task_name mnli_resplit \
     --train_file /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/train_resplit_with_features.json \
@@ -28,7 +28,7 @@ python -m torch.distributed.launch --nproc_per_node=1 learn_groups.py \
     --per_device_eval_batch_size 96 \
     --learning_rate 2e-5 \
     --num_train_epochs 20 \
-    --output_dir  /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_deberta_adversarial_bz128_epochs20_twostaged_9slices_instance_weights \
+    --output_dir  /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_deberta_adversarial_bz128_epochs20_twostaged_9slices \
     --overwrite_output_dir \
     --cache_dir /gscratch/zlab/bparan/projects/counterfactuals/data/NLI/MNLI/cache_ \
     --logging_steps 50 \
@@ -44,7 +44,6 @@ python -m torch.distributed.launch --nproc_per_node=1 learn_groups.py \
     --save_strategy epoch \
     --n_slices 9 \
     --adversary_warmup 5 \
-    --do_instance_reweight \
     --report_to none \
 
 #--adversary_model_name_or_path /mmfs1/gscratch/zlab/bparan/projects/counterfactuals/models/mnli_domino_9_slices_mlp/pytorch_model.bin \

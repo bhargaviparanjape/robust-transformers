@@ -32,12 +32,21 @@ class DominoSlicer(nn.Module):
         self.entropy_reg = args.entropy_reg
         self.marginal_reg = args.marginal_reg
 
+        # self.grouper_model = nn.Sequential(
+        #     nn.Linear(self.n_features, 64),
+        #     nn.ReLU(),
+        #     nn.Linear(64, 32),
+        #     nn.ReLU(),
+        #     nn.Linear(32, self.n_slices),
+        #     nn.Softmax()
+        # )
+
         self.grouper_model = nn.Sequential(
-            nn.Linear(self.n_features, 64),
+            nn.Linear(self.n_features, 128),
             nn.ReLU(),
-            nn.Linear(64, 32),
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(32, self.n_slices),
+            nn.Linear(64, self.n_slices),
             nn.Softmax()
         )
 
@@ -87,9 +96,9 @@ class DominoSlicer(nn.Module):
             return data.to(**kwargs)
         return data
 
-    def forward(self, input_ids, attention_mask, group, group_features=None, labels=None, adversary=False, **kwargs):
+    def forward(self, pixel_values, group, group_features=None, labels=None, instance_weight=None, adversary=False, **kwargs):
         # inputs has input_ids, attention_mask for task_model, group ids are computed dynamically based on features 
-        # which is a vector of size self.n_features 
+        # which is a vector of size self.n_features
         
         """
         1. Compute group distributions.
@@ -97,8 +106,18 @@ class DominoSlicer(nn.Module):
         2. Compute aggregate loss over groups.
         """
         self.group_distribution = self.grouper_model(group_features) # B * G
-        task_model_outputs = self.task_model(input_ids, attention_mask, labels=labels) 
+        task_model_outputs = self.task_model(pixel_values, labels=labels) 
         per_sample_losses = task_model_outputs["loss"] # B * 1 [Individual losses]
+            
+        # instance weights not used when training the adversary
+        if instance_weight is not None and self.do_instance_reweight and not adversary:
+            per_sample_losses = instance_weight*per_sample_losses
+
+        if self.training_args.eiil:
+            # multiply individual losses with scale (with respect to which we compute gradients for different environments across tasks)
+            # logits = nll(logits * scale) i.e. cross entropy (this will take some time to impliment since task_model already returns loss value after cross entropy)
+            # use yhat, a specifically defined cross entropy function here and overwrite individual losses.
+            pass
 
         # Group wise loss. 
         group_losses = self.compute_soft_group_loss(per_sample_losses, self.group_distribution)
@@ -112,8 +131,8 @@ class DominoSlicer(nn.Module):
         # group_map = (group == self._prepare_input(torch.arange(self.n_slices).unsqueeze(1).long())).float()
         # group_count = group_map.sum(1)
         
-        dist.all_reduce(group_count, op=ReduceOp.SUM)
-        dist.all_reduce(group_losses, op=ReduceOp.SUM)
+        # dist.all_reduce(group_count, op=ReduceOp.SUM)
+        # dist.all_reduce(group_losses, op=ReduceOp.SUM)
 
         # normalize group_wise loss.
         group_denom = group_count + (group_count==0).float() # avoid nans
@@ -126,7 +145,10 @@ class DominoSlicer(nn.Module):
         adjusted_loss = self.exp_avg_loss + self.adj/torch.sqrt(self.count_cat)
 
         if adversary:
-            loss, weights = self.compute_adversary_loss_greedy(group_losses, adjusted_loss)
+            if self.training_args.eiil:
+                loss, weights = self.compute_eiil_loss(group_losses, adjusted_loss)
+            else:
+                loss, weights = self.compute_adversary_loss_greedy(group_losses, adjusted_loss)
 
             # Regularizer 1 (Entropy of group distribution should be high)
             cp = Categorical(self.group_distribution)
@@ -196,14 +218,14 @@ class DominoSlicer(nn.Module):
         # scale weighted group losses by 1.0
         # Then take gradients of each group loss, compute its norm and take mean across groups
         # Finally add that as the penalty 
-        scale =  self._prepare_input(torch.tensor(1.).cuda().requires_grad_())
+        import pdb; pdb.set_trace()
+        scale =  self._prepare_input(torch.tensor(1.)).requires_grad_()
         group_grads = autograd.grad(group_loss, [scale], create_graph=True)[0]
         self.reverse_adv_probs =  self.reverse_adv_probs.new_full(self.reverse_adv_probs.size(), self.max_var_weight)
         penalty = torch.sum(group_grads**2)
         npenalty = - torch.stack(penalty).mean()
 
         return npenalty, self.reverse_adv_probs
-        
 
     def compute_adversary_loss_greedy(self, group_loss, ref_loss):
         

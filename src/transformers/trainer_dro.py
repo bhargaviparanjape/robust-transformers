@@ -742,7 +742,7 @@ class TrainerDro(Trainer):
         logging_dir = os.path.join(output_dir, f"training_dynamics")
         # Create directory for logging training dynamics, if it doesn't already exist.
         if not os.path.exists(logging_dir):
-            os.makedirs(logging_dir)
+            os.makedirs(logging_dir, exist_ok=True)
         epoch_file_name = os.path.join(logging_dir, f"dynamics_epoch_{epoch}.jsonl")
         td_df.to_json(epoch_file_name, lines=True, orient="records")
         logger.info(f"Training Dynamics logged to {epoch_file_name}")
@@ -760,7 +760,7 @@ class TrainerDro(Trainer):
         logging_dir = os.path.join(output_dir, f"dro_dynamics")
         # Create directory for logging training dynamics, if it doesn't already exist.
         if not os.path.exists(logging_dir):
-            os.makedirs(logging_dir)
+            os.makedirs(logging_dir, exist_ok=True)
         epoch_file_name = os.path.join(logging_dir, f"dro_dynamics.jsonl")
         td_df.to_json(epoch_file_name, lines=True, orient="records")
         logger.info(f"Training Dynamics logged to {epoch_file_name}")   
@@ -1239,7 +1239,14 @@ class TrainerDro(Trainer):
             become_better = False
             if self.dro_args.is_robust and args.metric_for_best_model == "eval_worst_accuracy":
                 resplit_train_epoch += 1
-                valid_group_acc = [(int(key.lstrip("eval_group_accuracy_")), metrics[key]) for key in metrics.keys() if key.startswith("eval_group_accuracy")]
+                
+                # Worst alpha groups are used for model selection by default.
+                if self.args.select_mega_worst_group:
+                    valid_group_acc = [(int(key.lstrip("eval_megagroup_accuracy_")), metrics[key]) for key in metrics.keys() if key.startswith("eval_megagroup_accuracy")]
+                else:
+                    valid_group_acc = [(int(key.lstrip("eval_group_accuracy_")), metrics[key]) for key in metrics.keys() if key.startswith("eval_group_accuracy")]
+
+
                 curr_worst_valid_acc = min([acc for _, acc in valid_group_acc])
                 sorted_by_group_id = sorted(valid_group_acc, key=lambda tup: tup[0])
                 group_acc = " ".join(["%d: %.3f" % (idx, acc if acc > 0 else -acc) for idx, acc in sorted_by_group_id])
@@ -2028,10 +2035,26 @@ class TrainerDro(Trainer):
 
         # Compute Worst Group Metrics, if group information is evailable in the evaluation set.
         if hasattr(self, "val_loss_computer"):
+
             n_eval_groups = self.val_loss_computer.n_groups
             key = "accuracy"
+            pred = self._prepare_input(torch.tensor((np.argmax(all_preds,1)==all_labels), dtype=torch.float32))
+            
+            groups = self._prepare_input(torch.tensor([ex["group"] for ex in self.eval_dataset]))
+            group_acc = self.val_loss_computer.compute_group_avg(pred, groups)[0]
             for group_idx in range(n_eval_groups):
-                metrics[f"group_{key}_{group_idx}"] = self.val_loss_computer.avg_group_acc[group_idx]
+                metrics[f"group_{key}_{group_idx}"] = group_acc[group_idx].item()
+
+            # group_acc = self.val_loss_computer.avg_group_acc
+            top_worst_groups = torch.argsort(group_acc)[:int(len(group_acc) * self.dro_args.alpha)].cpu().numpy()
+            mega_groups = self._prepare_input(torch.tensor([(0 if group.item() in top_worst_groups else 1) for group in groups]))
+            mega_group_map = (mega_groups == self._prepare_input(torch.arange(2).unsqueeze(1).long())).float()
+            mega_group_count = mega_group_map.sum(1)
+            mega_group_denom = mega_group_count + (mega_group_count==0).float() # avoid nans
+            mega_group_acc = (mega_group_map @ pred.view(-1))/mega_group_denom
+            for group_idx in range(2):
+                metrics[f"megagroup_{key}_{group_idx}"] = mega_group_acc[group_idx].item()
+
 
         # To be JSON-serializable, we need to remove numpy types or zero-d tensors
         metrics = denumpify_detensorize(metrics)

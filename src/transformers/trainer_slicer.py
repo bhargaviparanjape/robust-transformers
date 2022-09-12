@@ -121,7 +121,8 @@ from .trainer_utils import (
     set_seed,
     speed_metrics,
 )
-from .training_args import OptimizerNames, ParallelMode, TrainingArguments
+from .training_args import OptimizerNames, ParallelMode
+from .domino_training_args import DominoTrainingArguments
 from .utils import logging
 
 from .dro_loss import LossComputer, DroArguments
@@ -192,7 +193,7 @@ class TrainerSlicer(Trainer):
     def __init__(
             self,
             model: Union[PreTrainedModel, nn.Module] = None,
-            args: TrainingArguments = None,
+            args: DominoTrainingArguments = None,
             dro_args: DroArguments = None,
             data_collator: Optional[DataCollator] = None,
             train_dataset: Optional[Dataset] = None,
@@ -339,11 +340,13 @@ class TrainerSlicer(Trainer):
                         iterations: List[int],
                         group_probs: List[List[float]],
                         group_losses: List[List[float]],
+                        group_counts: List[List[float]],
                         ):
         td_df = pd.DataFrame({"epoch": epochs,
                                 f"iteration": iterations,
                                 "group_weight": group_probs,
-                                "group_loss": group_losses})
+                                "group_loss": group_losses,
+                                "group_counts": group_counts})
         logging_dir = os.path.join(output_dir, f"dro_dynamics")
         # Create directory for logging training dynamics, if it doesn't already exist.
         if not os.path.exists(logging_dir):
@@ -485,6 +488,7 @@ class TrainerSlicer(Trainer):
         iteration_list = []
         group_assignment_list = []
         group_loss_list = []
+        group_count_list = []
 
         # Book-keeping for model selection
         worst_valid_acc = None
@@ -511,6 +515,9 @@ class TrainerSlicer(Trainer):
 
             step = -1
 
+            # if adversary_warmup is set to X iterations, altrenate between training the adversary and primary for that many number of iterations
+            
+
             for step, inputs in enumerate(epoch_iterator):
 
                 if steps_trained_progress_bar is not None:
@@ -521,33 +528,37 @@ class TrainerSlicer(Trainer):
                     self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
                 
-                # Primary 
-                if (
-                    ((step + 1) % args.gradient_accumulation_steps != 0)
-                    and args.local_rank != -1
-                    and args._no_sync_in_gradient_accumulation
-                ):
-                    # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
-                    with model.no_sync():
+                # Primary
+                tr_loss_step_primary = torch.tensor(0.0).to(args.device)
+                if epoch >= args.adversary_warmup: 
+                    if (
+                        ((step + 1) % args.gradient_accumulation_steps != 0)
+                        and args.local_rank != -1
+                        and args._no_sync_in_gradient_accumulation
+                    ):
+                        # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
+                        with model.no_sync():
+                            tr_loss_step_primary, batch_logits = self.training_step_primary(model, inputs)
+                    else:
                         tr_loss_step_primary, batch_logits = self.training_step_primary(model, inputs)
-                else:
-                    tr_loss_step_primary, batch_logits = self.training_step_primary(model, inputs)
 
-                # Adversary
-                if (
-                    ((step + 1) % args.gradient_accumulation_steps != 0)
-                    and args.local_rank != -1
-                    and args._no_sync_in_gradient_accumulation
-                ):
-                    # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
-                    with model.no_sync():
+                # Adversary (which is only trained for some X number of epochs before not being used anymore)
+                # adversary warmup os for the number of epochs to train the adversary before not using it anymore.
+                if (args.adversary_warmup) == -1 or epoch < args.adversary_warmup:
+                    if (
+                        ((step + 1) % args.gradient_accumulation_steps != 0)
+                        and args.local_rank != -1
+                        and args._no_sync_in_gradient_accumulation
+                    ):
+                        # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
+                        with model.no_sync():
+                            tr_loss_step_adversary, batch_logits = self.training_step_adversary(model, inputs)
+                    else:
                         tr_loss_step_adversary, batch_logits = self.training_step_adversary(model, inputs)
-                else:
-                    tr_loss_step_adversary, batch_logits = self.training_step_adversary(model, inputs)
-                
 
-                wandb.log({"primary loss": tr_loss_step_primary.item()})
-                wandb.log({"adversary loss": tr_loss_step_adversary.item()})
+                # execute this if not doig parallel training
+                # wandb.log({"primary loss": tr_loss_step_primary.item()})
+                # wandb.log({"adversary loss": tr_loss_step_adversary.item()})
 
                 if (
                     args.logging_nan_inf_filter
@@ -631,12 +642,14 @@ class TrainerSlicer(Trainer):
                     # Just log, and save checkpoints, dont evaluate.
                     _ = self._maybe_log_save_evaluate(tr_loss_primary, model, trial, epoch, ignore_keys_for_eval, evaluate=False)
                     if self.dro_args.is_robust and self.state.global_step % self.args.logging_steps == 0:
-                        model.log_stats(logger, True)
-                        self.log(model.get_stats(model, args))
+                        model.module.log_stats(logger, True)
+                        self.log(model.module.get_stats(model, args))
                         iteration_list.append(step)
                         epoch_list.append(epoch)
-                        group_assignment_list.append(list(model.adv_probs.cpu().numpy()))
-                        group_loss_list.append(list(model.group_loss.detach().cpu().numpy()))
+                        group_assignment_list.append(list(model.module.adv_probs.cpu().numpy()))
+                        group_loss_list.append(list(model.module.group_loss.detach().cpu().numpy()))
+                        group_count_list.append(list(model.module.processed_data_counts.detach().cpu().numpy()))
+                        # add group count.
                         # there is a mismatch between Chunting's code where reset happens only after 1 epoch. 
                         # self.train_loss_computer.reset_stats()
                         
@@ -645,12 +658,12 @@ class TrainerSlicer(Trainer):
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
-
+            
             # End of epoch, reset train loss computer.
-            if self.dro_args.is_robust and model.batch_count > 0:
-                model.log_stats(logger, True)
-                self.log(model.get_stats(model, args))
-                model.reset_stats()
+            if self.dro_args.is_robust and model.module.batch_count > 0:
+                model.module.log_stats(logger, True)
+                self.log(model.module.get_stats(model, args))
+                model.module.reset_stats()
 
                 if self.dro_args.robust_algorithm == "GCDRO":
                     self._update_columns(epoch=epoch) #, dataloader=epoch_iterator)
@@ -674,37 +687,44 @@ class TrainerSlicer(Trainer):
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
 
             # this is going to save but only after its worst accuracy has been computed.
-            metrics = self._maybe_log_save_evaluate(tr_loss_primary, model, trial, epoch, ignore_keys_for_eval, evaluate=True)
+            # only start to evaluate, when you are no longer training the adversary model 
+            if epoch >= args.adversary_warmup:
+                metrics = self._maybe_log_save_evaluate(tr_loss_primary, model, trial, epoch, ignore_keys_for_eval, evaluate=True)
 
-            # Training stopping criterion
-            become_better = False
-            if self.dro_args.is_robust and args.metric_for_best_model == "eval_worst_accuracy":
-                resplit_train_epoch += 1
-                valid_group_acc = [(int(key.lstrip("eval_group_accuracy_")), metrics[key]) for key in metrics.keys() if key.startswith("eval_group_accuracy")]
-                curr_worst_valid_acc = min([acc for _, acc in valid_group_acc])
-                sorted_by_group_id = sorted(valid_group_acc, key=lambda tup: tup[0])
-                group_acc = " ".join(["%d: %.3f" % (idx, acc if acc > 0 else -acc) for idx, acc in sorted_by_group_id])
-                become_better = (worst_valid_acc is not None and curr_worst_valid_acc > worst_valid_acc) or worst_valid_acc is None
-                worst_valid_acc = curr_worst_valid_acc if worst_valid_acc is None else max(curr_worst_valid_acc, worst_valid_acc)
-                bad_counts = 0 if become_better else bad_counts + 1
+                # Training stopping criterion
+                become_better = False
+                if self.dro_args.is_robust and args.metric_for_best_model == "eval_worst_accuracy":
+                    resplit_train_epoch += 1
 
-                logger.info("Valid group performance: {}".format(group_acc))
-                logger.info("Better worst valid = {}, bad counts = {}, worst acc = {}".format(become_better, bad_counts, curr_worst_valid_acc))
-                # Update metrics (best_worst_group)
-                metrics["eval_worst_accuracy"] = worst_valid_acc
-            else:
-                # Even with robust training, this code will get triggered.
-                current_valid_acc = metrics["eval_accuracy"]
-                become_better = (valid_acc is not None  and current_valid_acc > valid_acc) or valid_acc is None
-                valid_acc = current_valid_acc if valid_acc is None else max(current_valid_acc, valid_acc)
-                bad_counts = 0 if become_better else bad_counts + 1
-                logger.info("Valid performance: {}".format(current_valid_acc))
-                logger.info("Better valid = {}, bad counts = {}, best acc = {}".format(become_better, bad_counts, current_valid_acc))
+                    if self.args.select_predicted_worst_group:
+                        valid_group_acc = [(int(key.lstrip("eval_megagroup_accuracy_")), metrics[key]) for key in metrics.keys() if key.startswith("eval_megagroup_accuracy")]
+                    else:
+                        valid_group_acc = [(int(key.lstrip("eval_group_accuracy_")), metrics[key]) for key in metrics.keys() if key.startswith("eval_group_accuracy")]
 
-            # Model selection (save checkpoint with best worst_accuracy as the "best_" checkpoint)
-            if become_better:
-                # First time worst_accuracy is computed, or worst accuracy improved.
-                self._save_checkpoint(model, trial, metrics=metrics, save_best=True)
+                    curr_worst_valid_acc = min([acc for _, acc in valid_group_acc])
+                    sorted_by_group_id = sorted(valid_group_acc, key=lambda tup: tup[0])
+                    group_acc = " ".join(["%d: %.3f" % (idx, acc if acc > 0 else -acc) for idx, acc in sorted_by_group_id])
+                    become_better = (worst_valid_acc is not None and curr_worst_valid_acc > worst_valid_acc) or worst_valid_acc is None
+                    worst_valid_acc = curr_worst_valid_acc if worst_valid_acc is None else max(curr_worst_valid_acc, worst_valid_acc)
+                    bad_counts = 0 if become_better else bad_counts + 1
+
+                    logger.info("Valid group performance: {}".format(group_acc))
+                    logger.info("Better worst valid = {}, bad counts = {}, worst acc = {}".format(become_better, bad_counts, curr_worst_valid_acc))
+                    # Update metrics (best_worst_group)
+                    metrics["eval_worst_accuracy"] = worst_valid_acc
+                else:
+                    # Even with robust training, this code will get triggered.
+                    current_valid_acc = metrics["eval_accuracy"]
+                    become_better = (valid_acc is not None  and current_valid_acc > valid_acc) or valid_acc is None
+                    valid_acc = current_valid_acc if valid_acc is None else max(current_valid_acc, valid_acc)
+                    bad_counts = 0 if become_better else bad_counts + 1
+                    logger.info("Valid performance: {}".format(current_valid_acc))
+                    logger.info("Better valid = {}, bad counts = {}, best acc = {}".format(become_better, bad_counts, current_valid_acc))
+
+                # Model selection (save checkpoint with best worst_accuracy as the "best_" checkpoint)
+                if become_better:
+                    # First time worst_accuracy is computed, or worst accuracy improved.
+                    self._save_checkpoint(model, trial, metrics=metrics, save_best=True)
 
             if self.control.should_training_stop:
                 break
@@ -712,7 +732,7 @@ class TrainerSlicer(Trainer):
         # End of training
 
         # Dump dro group assignments to file.
-        self.log_dro_dynamics(output_dir=args.output_dir, epochs=epoch_list, iterations=iteration_list, group_probs=group_assignment_list, group_losses=group_loss_list)
+        self.log_dro_dynamics(output_dir=args.output_dir, epochs=epoch_list, iterations=iteration_list, group_probs=group_assignment_list, group_losses=group_loss_list, group_counts=group_count_list)
 
         
         if args.past_index and hasattr(self, "_past"):
@@ -774,6 +794,65 @@ class TrainerSlicer(Trainer):
 
         return TrainOutput(self.state.global_step, train_loss, metrics)
 
+    def _load_state_dict_in_model(self, state_dict):
+        load_result = self.model.task_model.load_state_dict(state_dict, strict=False)
+
+        if len(load_result.missing_keys) != 0:
+            if self.model.task_model._keys_to_ignore_on_save is not None and set(load_result.missing_keys) == set(
+                self.model.task_model._keys_to_ignore_on_save
+            ):
+                self.model.task_model.tie_weights()
+            else:
+                logger.warning(f"There were missing keys in the checkpoint model loaded: {load_result.missing_keys}.")
+        if len(load_result.unexpected_keys) != 0:
+            logger.warning(
+                f"There were unexpected keys in the checkpoint model loaded: {load_result.unexpected_keys}."
+            )
+    
+    def create_optimizer(self):
+        """
+        Setup the optimizer.
+
+        We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
+        Trainer's init through `optimizers`, or subclass and override this method in a subclass.
+        """
+        if self.optimizer is None:
+            decay_parameters = get_parameter_names(self.model, [nn.LayerNorm])
+            decay_parameters = [name for name in decay_parameters if "bias" not in name]
+            decay_task_parameters = [name for name in decay_parameters if "grouper_model" not in name]
+            decay_grouper_parameters = [name for name in decay_parameters if "grouper_model" in name]
+            optimizer_grouped_parameters = [
+                {
+                    "params": [p for n, p in self.model.named_parameters() if n in decay_task_parameters],
+                    "weight_decay": self.args.weight_decay,
+                },
+                {
+                    "params": [p for n, p in self.model.named_parameters() if n in decay_grouper_parameters],
+                    "weight_decay": self.args.weight_decay,
+                    "lr": self.args.grouper_learning_rate,
+                },
+                {
+                    "params": [p for n, p in self.model.named_parameters() if n not in decay_parameters],
+                    "weight_decay": 0.0,
+                },
+            ]
+
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+
+            if self.sharded_ddp == ShardedDDPOption.SIMPLE:
+                self.optimizer = OSS(
+                    params=optimizer_grouped_parameters,
+                    optim=optimizer_cls,
+                    **optimizer_kwargs,
+                )
+            else:
+                self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+        if is_sagemaker_mp_enabled():
+            self.optimizer = smp.DistributedOptimizer(self.optimizer)
+
+        return self.optimizer
+
     
     def _maybe_log_save_evaluate(self, tr_loss, model, trial, epoch, ignore_keys_for_eval, evaluate=False):
         if self.control.should_log:
@@ -803,7 +882,9 @@ class TrainerSlicer(Trainer):
             self._report_to_hp_search(trial, epoch, metrics)
 
         if self.control.should_save:
-            self._save_checkpoint(model, trial, metrics=metrics)
+            # may_log_and_save is called at the end of every epoch or after every iteration, and save_checkpoint is based on save_strategy.
+            # setting metrics to none so that metric_to_check is not evaluated.
+            self._save_checkpoint(model, trial, metrics=None)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
         
         return metrics
@@ -968,6 +1049,7 @@ class TrainerSlicer(Trainer):
             self._signature_columns += ["group"]
             self._signature_columns += ["group_distribution"]
             self._signature_columns += ["instance_weight"]
+            self._signature_columns += ["group_features"]
 
         ignored_columns = list(set(dataset.column_names) - set(self._signature_columns))
         if len(ignored_columns) > 0:
@@ -996,11 +1078,19 @@ class TrainerSlicer(Trainer):
         if self.train_dataset is not None:
             instance_weights = self.model.compute_beta_cover(seed, epoch, self.train_dataset)
             self.train_dataset = self.train_dataset.add_column("instance_weight", instance_weights)
+        # eval datasets also need instance reweight is available, but do not update weight array of the model itself.
+        if self.eval_dataset is not None:
+            instance_weights = np.ones(len(self.eval_dataset)) # default and does not get udpated.
+            self.eval_dataset = self.eval_dataset.add_column("instance_weight", instance_weights)
 
     def _update_columns(self, epoch):
         # Iterate over training data to compute loss.
+        if epoch < self.args.adversary_warmup:
+            logger.info(f"---- Skipping Re-Weight in {epoch} due to adversary training -----")
+            return
         logger.info(f"---- Re-Weight at the begeinning of epoch {epoch} -----")
         train_losses = None
+        train_groups = None
         dataset = self._remove_unused_columns(self.train_dataset, description="evaluation")
         dataloader = DataLoader(
                     dataset,
@@ -1019,20 +1109,28 @@ class TrainerSlicer(Trainer):
                 groups = inputs["group"]
                 group_distributions = inputs.get("group_distribution", None)
                 instance_weights = inputs.get("instance_weight", None)
+                group_features = inputs.get("group_features", None)
                 del inputs["group"]
                 if group_distributions is not None:
                     del inputs["group_distribution"]
                 if instance_weights is not None:
                     del inputs["instance_weight"]
+                if group_features is not None:
+                    del inputs["group_features"]
                 del inputs["guid"]
                 outputs = model.task_model(**inputs)
+                groups = torch.argmax(model.grouper_model(group_features), dim=1)
                 loss, _ = outputs[0], outputs[1]
                 if train_losses is None:
                     train_losses = loss.detach().cpu().numpy()
                 else:
                     train_losses = np.append(train_losses, loss.detach().cpu().numpy(), axis=0)
+                if train_groups is None:
+                    train_groups = groups.detach().cpu().numpy()
+                else:
+                    train_groups = np.append(train_groups, groups.detach().cpu().numpy(), axis=0)
         # Process losses to compute beta cover weights 
-        instance_weights = model.compute_beta_cover(self.args.seed, epoch, self.train_dataset, train_losses)
+        instance_weights = model.compute_beta_cover(self.args.seed, epoch, self.train_dataset, train_losses, train_groups)
         # Update "instance_weights of self.train_dataset in dataloader (in the middle of training)
         # TODO: Check if the dataloader which is consistent, is actually using the updated weights. 
         self.train_dataset = self.train_dataset.remove_columns("instance_weight")
@@ -1120,22 +1218,30 @@ class TrainerSlicer(Trainer):
             raise ValueError("Trainer: training requires a train_dataset.")
 
         train_dataset = self.train_dataset
-        train_features = self.train_features
+                
         if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
             train_dataset = self._remove_unused_columns(train_dataset, description="training")
+        
+        """
+        train_feature_dict = {}
+        for index, row in train_features.iterrows():
+            guid = row.guid
+            emb = row.emb
+            pred_prob = row.pred_probs
+            target = np.asarray([row.target])
+            feature_vector =  list(np.concatenate([emb, pred_prob, target]))
+            train_feature_dict[guid] = feature_vector
+        # Add other features : Dynamics, perturbed features etc...
         
         train_feature_list = []
         for id_, ex in enumerate(train_dataset):
             guid = ex["guid"]
-            features = train_features.loc[train_features["guid"] == ex["guid"]]
-            emb = features["emb"].to_numpy()[0]
-            pred_prob = features["pred_probs"].to_numpy()[0]
-            target = features["target"].to_numpy()
-            train_feature_list.append(list(np.concatenate([emb, pred_prob, target])))
-            # Add other features : Dynamics, perturbed features etc...
-        logger.info(f'Train features for adversary model loaded')
+            train_feature_list.append(train_feature_dict[guid])
 
         train_dataset = train_dataset.add_column("group_features", train_feature_list)
+        """
+        
+        logger.info(f'Train features for adversary model loaded')
 
         if isinstance(train_dataset, torch.utils.data.IterableDataset):
             if self.args.world_size > 1:
@@ -1172,7 +1278,7 @@ class TrainerSlicer(Trainer):
         model.train()
 
         # Freeze grouper model parameters while training primary model
-        for param in model.grouper_model.parameters():
+        for param in model.module.grouper_model.parameters():
             param.requires_grad = False
 
         inputs = self._prepare_inputs(inputs)
@@ -1186,8 +1292,9 @@ class TrainerSlicer(Trainer):
             # del inputs["group"]
             if group_distributions is not None:
                 del inputs["group_distribution"]
-            if instance_weights is not None:
-                del inputs["instance_weight"]
+            # Only reweight during task adversary phase.
+            # if instance_weights is not None:
+            #     del inputs["instance_weight"]
             loss, outputs = self.compute_loss_primary(model, inputs, return_outputs=True)
             # Here is where GCDRO loss was computed.
             loss = loss.mean() # This is not need.
@@ -1218,7 +1325,7 @@ class TrainerSlicer(Trainer):
             loss.backward()
 
         # Unfreeze grouper model parameters while training primary model
-        for param in model.grouper_model.parameters():
+        for param in model.module.grouper_model.parameters():
             param.requires_grad = True
 
         return loss.detach(), logits
@@ -1228,7 +1335,7 @@ class TrainerSlicer(Trainer):
         model.train()
 
         # Freeze task model parameters while training adversary grouper model
-        for param in model.task_model.parameters():
+        for param in model.module.task_model.parameters():
             param.requires_grad = False
         
         inputs = self._prepare_inputs(inputs)
@@ -1274,7 +1381,7 @@ class TrainerSlicer(Trainer):
             loss.backward()
 
         # Unfreeze task model parameters while training adversary grouper model
-        for param in model.task_model.parameters():
+        for param in model.module.task_model.parameters():
             param.requires_grad = True
 
         return loss.detach(), logits
@@ -1566,10 +1673,16 @@ class TrainerSlicer(Trainer):
         losses_host = None
         preds_host = None
         labels_host = None
+        
         # losses/preds/labels on CPU (final containers)
         all_losses = None
         all_preds = None
         all_labels = None
+
+        # also compute current groups so that we are selecting worst group performance based on predicted group performance.
+        groups_host = None
+        all_groups = None
+        
         # Will be useful when we have an iterable dataset so don't know its length.
 
         observed_num_examples = 0
@@ -1587,6 +1700,12 @@ class TrainerSlicer(Trainer):
             # TODO(bparan): Inputs needs to be stripped of non-tensor metadata to be sent to model forward function.
             # Metadata information can be used to either log model performance, or provide group information. 
             # del inputs["guid"]
+
+            # compute argmax group on the evalset
+            inputs = self._prepare_inputs(inputs)
+            group_distribution = model.grouper_model(inputs["group_features"])
+            group = torch.argmax(group_distribution, axis=1)
+
             loss, logits, labels = self.prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
 
 
@@ -1597,6 +1716,9 @@ class TrainerSlicer(Trainer):
             if loss is not None:
                 losses = self._nested_gather(loss.repeat(batch_size))
                 losses_host = losses if losses_host is None else torch.cat((losses_host, losses), dim=0)
+            if group is not None:
+                groups = self._nested_gather(group)
+                groups_host = groups if groups_host is None else nested_concat(groups_host, groups, padding_index=-100)
             if labels is not None:
                 labels = self._pad_across_processes(labels)
                 labels = self._nested_gather(labels)
@@ -1607,6 +1729,8 @@ class TrainerSlicer(Trainer):
                 if self.preprocess_logits_for_metrics is not None:
                     logits = self.preprocess_logits_for_metrics(logits, labels)
                 preds_host = logits if preds_host is None else nested_concat(preds_host, logits, padding_index=-100)
+            
+            
             self.control = self.callback_handler.on_prediction_step(args, self.state, self.control)
 
             # Gather all tensors and put them back on the CPU if we have done enough accumulation steps.
@@ -1622,7 +1746,11 @@ class TrainerSlicer(Trainer):
                     all_labels = (
                         labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
                     )
-
+                if groups_host is not None:
+                    groups = nested_numpify(groups_host)
+                    all_groups = (
+                        groups if all_groups is None else nested_concat(all_groups, groups, padding_index=-100)
+                    )
                 # Set back to None to begin a new accumulation
                 losses_host, preds_host, labels_host = None, None, None
 
@@ -1640,6 +1768,12 @@ class TrainerSlicer(Trainer):
         if labels_host is not None:
             labels = nested_numpify(labels_host)
             all_labels = labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+        if groups_host is not None:
+            groups = nested_numpify(groups_host)
+            all_groups = (
+                groups if all_groups is None else nested_concat(all_groups, groups, padding_index=-100)
+            )
+
 
         # Number of samples
         if has_length(eval_dataset):
@@ -1659,6 +1793,8 @@ class TrainerSlicer(Trainer):
             all_preds = nested_truncate(all_preds, num_samples)
         if all_labels is not None:
             all_labels = nested_truncate(all_labels, num_samples)
+        if all_groups is not None:
+            all_groups = nested_truncate(all_groups, num_samples)
 
         # Metrics!
         if self.compute_metrics is not None and all_preds is not None and all_labels is not None:
@@ -1668,12 +1804,39 @@ class TrainerSlicer(Trainer):
 
         # Compute Worst Group Metrics, if group information is evailable in the evaluation set.
         if hasattr(self, "val_loss_computer"):
-            n_eval_groups = self.val_loss_computer.n_groups
+            
             key = "accuracy"
-            # val_loss_computer was not used to actually record loss computation.
-            import pdb; pdb.set_trace()
+            pred = self._prepare_input(torch.tensor((np.argmax(all_preds,1)==all_labels), dtype=torch.float32))
+
+            if self.args.select_predicted_worst_group:
+                n_eval_groups = model.n_slices 
+                groups = self._prepare_input(torch.tensor(groups)) #TODO: this may have to change for multigpus.
+                group_map = (groups == self._prepare_input(torch.arange(model.n_slices).unsqueeze(1).long())).float()
+                group_count = group_map.sum(1)
+                group_denom = group_count + (group_count==0).float() # avoid nans
+                group_acc = (group_map @ pred.view(-1))/group_denom
+            else:
+                n_eval_groups = self.val_loss_computer.n_groups
+                groups = self._prepare_input(torch.tensor([ex["group"] for ex in self.eval_dataset]))
+                group_acc = self.val_loss_computer.compute_group_avg(pred, groups)[0]
+
             for group_idx in range(n_eval_groups):
-                metrics[f"group_{key}_{group_idx}"] = self.val_loss_computer.avg_group_acc[group_idx]
+                metrics[f"group_{key}_{group_idx}"] = group_acc[group_idx].item()
+
+            if self.args.select_predicted_worst_group:
+                # select accuracy of top k worst loss groups and assign a new probability to them.
+                # find 50% of groups that have lowest group counts
+                # mega_group 0 rest are mega_group 1
+                # alpha proportion of the groups ought to be selected
+                # top_worst_groups = torch.argsort(group_acc)[:int(len(group_acc)/2)+ 1].cpu().numpy()
+                top_worst_groups = torch.argsort(group_acc)[:int(len(group_acc) * self.dro_args.alpha)].cpu().numpy()
+                mega_groups = self._prepare_input(torch.tensor([(0 if group.item() in top_worst_groups else 1) for group in groups]))
+                mega_group_map = (mega_groups == self._prepare_input(torch.arange(2).unsqueeze(1).long())).float()
+                mega_group_count = mega_group_map.sum(1)
+                mega_group_denom = mega_group_count + (mega_group_count==0).float() # avoid nans
+                mega_group_acc = (mega_group_map @ pred.view(-1))/mega_group_denom
+                for group_idx in range(2):
+                    metrics[f"megagroup_{key}_{group_idx}"] = mega_group_acc[group_idx].item()
 
         # To be JSON-serializable, we need to remove numpy types or zero-d tensors
         metrics = denumpify_detensorize(metrics)
@@ -1761,11 +1924,14 @@ class TrainerSlicer(Trainer):
                         groups = inputs["group"]
                         group_distributions = inputs.get("group_distribution", None)
                         instance_weights = inputs.get("instance_weight", None)
-                        del inputs["group"]
+                        group_features = inputs.get("group_features", None)
                         if group_distributions is not None:
                             del inputs["group_distribution"]
                         if instance_weights is not None:
                             del inputs["instance_weight"]
+                        if group_features is not None:
+                            del inputs["group_features"]
+                        del inputs["group"]
                         del inputs["guid"]
                         # We are also loading eval features.
                         outputs = model.task_model(**inputs)
@@ -1783,17 +1949,22 @@ class TrainerSlicer(Trainer):
                     loss = None
                     with self.autocast_smart_context_manager():
                         #TODO: Remove non-tensorizable elements from inputs.
+                        groups = inputs["group"]
+                        group_features = inputs.get("group_features", None)
                         del inputs["guid"]
+                        del inputs["group"]
                         #del inputs["group"]
                         if self.dro_args.use_group_weights or "group_distribution" in inputs:
                             del inputs["group_distribution"]
                         if "instance_weight" in inputs:
                             del inputs["instance_weight"]
-                        outputs = model(**inputs)
+                        if group_features is not None:
+                            del inputs["group_features"]
+                        outputs = model.task_model(**inputs)
                     if isinstance(outputs, dict):
                         logits = tuple(v for k, v in outputs.items() if k not in ignore_keys)
                     else:
-                        logits = outputs
+                        logits = outputs[0]
                     # TODO: this needs to be fixed and made cleaner later.
                     if self.args.past_index >= 0:
                         self._past = outputs[self.args.past_index - 1]
@@ -1806,3 +1977,35 @@ class TrainerSlicer(Trainer):
             logits = logits[0]
 
         return (loss, logits, labels)
+
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        # If we are executing this function, we are the process zero, so we don't check for that.
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Saving model checkpoint to {output_dir}")
+        # Save a trained model and configuration using `save_pretrained()`.
+        # They can then be reloaded using `from_pretrained()`
+        if not isinstance(self.model, PreTrainedModel):
+            if isinstance(unwrap_model(self.model), PreTrainedModel):
+                if state_dict is None:
+                    state_dict = self.model.state_dict()
+                unwrap_model(self.model).save_pretrained(output_dir, state_dict=state_dict)
+            else:
+                logger.info("Saving Trainer.model separately into task model and grouper model")
+                task_model = self.model.task_model
+                grouper_model = self.model.grouper_model
+                if state_dict is None:
+                    state_dict = task_model.state_dict()
+                # torch.save(state_dict, os.path.join(output_dir, WEIGHTS_NAME))
+                task_model.save_pretrained(output_dir, state_dict=state_dict)
+                grouper_state_dict = grouper_model.state_dict()
+                os.makedirs(os.path.join(output_dir, "grouper"), exist_ok=True)
+                torch.save(grouper_state_dict, os.path.join(output_dir, "grouper", WEIGHTS_NAME))   
+        else:
+            self.model.save_pretrained(output_dir, state_dict=state_dict)
+        if self.tokenizer is not None:
+            self.tokenizer.save_pretrained(output_dir)
+
+        # Good practice: save your training arguments together with the trained model
+        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))

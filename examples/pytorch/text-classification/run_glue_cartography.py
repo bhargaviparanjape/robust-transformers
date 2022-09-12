@@ -40,6 +40,7 @@ from transformers import (
     TrainerDro,
     TrainerDroGA,
     TrainingArguments,
+    DominoTrainingArguments,
     DroArguments,
     cartography_data_collator,
     set_seed,
@@ -80,7 +81,7 @@ custom_task_to_keys = {
 
 
 logger = logging.getLogger(__name__)
-
+transformers.logging.set_verbosity_error()
 
 @dataclass
 class DataTrainingArguments:
@@ -215,7 +216,7 @@ def main():
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, DroArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, DominoTrainingArguments, DroArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.

@@ -6,14 +6,14 @@ python generate_features.py \
     --model_name_or_path ${model} \
     --custom_task_name mnli_resplit \
     --cluster_dev_features \
-    --n_slices 24 \
+    --n_slices 500 \
     --init_type confusion \
-    --n_mixture_components 24 \
+    --n_mixture_components 500 \
     --train_file ${data}/${train_file} \
     --validation_file ${data}/${eval_file} \
     --test_file ${data}/${eval_file} \
-    --cluster_assgn_file ${model}/clustering/dev_output_24_slices.pkl \
-    --output_file ${data}/automatic_slicing/dev_resplit_slicing_error_aware_24slices.json \
+    --cluster_assgn_file ${model}/clustering/dev_output_500_slices.pkl \
+    --output_file ${data}/automatic_slicing/dev_resplit_slicing_error_aware_500slices.json \
     --max_seq_length 128 \
     --per_device_train_batch_size 768 \
     --per_device_eval_batch_size 768 \

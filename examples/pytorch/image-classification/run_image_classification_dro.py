@@ -16,6 +16,8 @@
 import logging
 import os
 import sys
+import jsonlines
+import json
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -42,8 +44,11 @@ from transformers import (
     AutoFeatureExtractor,
     AutoModelForImageClassification,
     HfArgumentParser,
-    Trainer,
+    TrainerDro,
     TrainingArguments,
+    DroArguments,
+    cartography_data_collator,
+    set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version
@@ -109,6 +114,18 @@ class DataTrainingArguments:
         default=-1,
         metadata={
             "help": "Indicate which fold of the training data to use. -1 means use all training data"
+        },
+    )
+    train_metadata_file: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Group, and group distribution information (indexed by image id/guid) for train dataset"
+        },
+    )
+    validation_metadata_file: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Group, and group distribution information (indexed by image id/guid) for train dataset"
         },
     )
 
@@ -182,7 +199,11 @@ class ModelArguments:
 def collate_fn(examples):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     labels = torch.tensor([example["labels"] for example in examples])
-    return {"pixel_values": pixel_values, "labels": labels}
+    groups = torch.tensor([example["group"] for example in examples])
+    instance_weights = torch.tensor([example.get("instance_weight", 1.0) for example in examples])
+    group_distribution = torch.stack([torch.tensor(example["group_distribution"]) for example in examples])
+    guids = [example["guid"] for example in examples]
+    return {"pixel_values": pixel_values, "labels": labels, "instance_weight": instance_weights, "guid": guids, "group" : groups, "group_distribution": group_distribution}
 
 
 def main():
@@ -190,13 +211,13 @@ def main():
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, DroArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args, dro_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        model_args, data_args, training_args, dro_args = parser.parse_args_into_dataclasses()
 
     # Setup logging
     logging.basicConfig(
@@ -262,8 +283,6 @@ def main():
         label2id[label] = str(i)
         id2label[str(i)] = label
 
-    # explicitly find guid from image id (filename) and and add it as a column to the training and validation data.
-    
 
     # if doing k fold validation, then train and validation are obtained from splits in train itself.
     if data_args.k_fold>=0:
@@ -332,6 +351,36 @@ def main():
         ]
     )
 
+
+    # ds["train"][0]['image'].filename to get groups
+    
+    train_guid_array = []
+    for ex in ds["train"]:
+        filename = ex["image"].filename
+        image_id = filename.split("/")[-1]
+        train_guid_array.append(image_id)
+    validation_guid_array = []
+    for ex in ds["validation"]:
+        filename = ex["image"].filename
+        image_id = filename.split("/")[-1]
+        validation_guid_array.append(image_id)
+
+    # get group information to send to trainer_dro.
+    train_metadata = json.loads(open(data_args.train_metadata_file).read())
+    validation_metadata = json.loads(open(data_args.validation_metadata_file).read())
+    # get group, group_distribution id indexed by guid
+
+    ds["train"] = ds["train"].add_column("guid", train_guid_array)
+    train_groups = [train_metadata[guid]["group"] for guid in train_guid_array]
+    ds["train"] = ds["train"].add_column("group", train_groups)
+    ds["train"] = ds["train"].add_column("group_distribution", [train_metadata[guid]["group_distribution"] for guid in train_guid_array])
+
+    ds["validation"] = ds["validation"].add_column("guid", validation_guid_array)
+    validation_groups = [validation_metadata[guid]["group"] for guid in validation_guid_array]
+    ds["validation"] = ds["validation"].add_column("group", validation_groups)
+    ds["validation"] = ds["validation"].add_column("group_distribution", [validation_metadata[guid]["group_distribution"] for guid in validation_guid_array])
+
+
     def train_transforms(example_batch):
         """Apply _train_transforms across a batch."""
         example_batch["pixel_values"] = [
@@ -362,23 +411,22 @@ def main():
         # Set the validation transforms
         ds["validation"].set_transform(val_transforms)
 
-
-    # ds["train"][0]['image'].filename to get groups
-    train_guid_array = []
-    for ex in ds["train"]:
-        filename = ex["image"].filename
-        image_id = filename.split("/")[-1]
-        train_guid_array.append(image_id)
-    validation_guid_array = []
-    for ex in ds["validation"]:
-        filename = ex["image"].filename
-        image_id = filename.split("/")[-1]
-        validation_guid_array.append(image_id)
+    if dro_args.is_robust: # and training_args.do_train:
+        unique_groups, group_counts = np.unique(train_groups, return_counts=True)
+        dro_args.n_groups = len(unique_groups)
+        dro_args.group_counts = torch.LongTensor(group_counts)
+    
+    if dro_args.reweight_groups: # and training_args.do_train:
+        # For ERM models, you need group_counts for weighted sampling.
+        unique_groups, group_counts = np.unique(train_groups, return_counts=True)
+        dro_args.n_groups = len(unique_groups)
+        dro_args.group_counts = torch.LongTensor(group_counts)
 
     # Initalize our trainer
-    trainer = Trainer(
+    trainer = TrainerDro(
         model=model,
         args=training_args,
+        dro_args=dro_args,
         train_dataset=ds["train"] if training_args.do_train else None,
         eval_dataset=ds["validation"] if training_args.do_eval else None,
         compute_metrics=compute_metrics,
