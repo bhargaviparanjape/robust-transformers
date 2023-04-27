@@ -23,7 +23,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 from tqdm.auto import tqdm
-
+import pdb
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +330,7 @@ def postprocess_qa_predictions_with_beam_search(
             # This is what will allow us to map some the positions in our logits to span of texts in the original
             # context.
             offset_mapping = features[feature_index]["offset_mapping"]
+            offset_mapping = [(o if (o and len(o)) else None) for o in offset_mapping] #TODO: Why is this code needed?
             # Optional `token_is_max_context`, if provided we will remove answers that do not have the maximum context
             # available in the current feature.
             token_is_max_context = features[feature_index].get("token_is_max_context", None)
@@ -394,6 +395,8 @@ def postprocess_qa_predictions_with_beam_search(
             pred["probability"] = prob
 
         # Pick the best prediction and set the probability for the null answer.
+        if min_null_score is None:
+            import pdb; pdb.set_trace()
         all_predictions[example["id"]] = predictions[0]["text"]
         if version_2_with_negative:
             scores_diff_json[example["id"]] = float(min_null_score)

@@ -23,9 +23,17 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
+import numpy as np
+import copy
+import re
+import tqdm
+import pdb
+import json
+import random
 
 import datasets
 from datasets import load_dataset, load_metric
+from datasets import Dataset, DatasetDict
 
 import transformers
 from trainer_seq2seq_qa import QuestionAnsweringSeq2SeqTrainer
@@ -95,6 +103,27 @@ class DataTrainingArguments:
 
     dataset_name: Optional[str] = field(
         default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
+    )
+    data_dir: Optional[str] = field(
+        default=None, metadata={"help": "Data folder for newsQA"}
+    )
+    no_answer_threshold: Optional[float] = field(
+        default=1.0, metadata={"help": "Custom no answer threshold for SQuAD 2.0."}
+    )
+    partial_inputs: Optional[str] = field(
+        default=None, metadata={"help": "which kind of partial input perturbation to make"}
+    )
+    question_only: Optional[bool] = field(
+        default=False, metadata={"help": "Question only training"}
+    )
+    passage_only: Optional[bool] = field(
+        default=False, metadata={"help": "Passage only training"}
+    )
+    augment_data: Optional[bool] = field(
+        default=False, metadata={"help": "Augment counterfactual data"}
+    )
+    partial_seed: Optional[int] = field(
+        default=1234, metadata={"help": "partial input seed"}
     )
     dataset_config_name: Optional[str] = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
@@ -302,9 +331,16 @@ def main():
     # download the dataset.
     if data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
-        raw_datasets = load_dataset(
-            data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir
-        )
+        if data_args.dataset_name == "newsqa_custom":
+            data_files = {
+                    "train":os.path.join(data_args.data_dir, "train.json"),
+                    "validation":os.path.join(data_args.data_dir, "validation.json"),
+                    "test":os.path.join(data_args.data_dir, "test.json")}
+            raw_datasets = load_dataset("json", cache_dir=model_args.cache_dir, data_files=data_files)
+        else:
+            raw_datasets = load_dataset(
+                data_args.dataset_name, data_args.dataset_config_name, cache_dir=model_args.cache_dir
+            )
     else:
         data_files = {}
         if data_args.train_file is not None:
@@ -318,6 +354,7 @@ def main():
             data_files["test"] = data_args.test_file
             extension = data_args.test_file.split(".")[-1]
         raw_datasets = load_dataset(extension, data_files=data_files, field="data", cache_dir=model_args.cache_dir)
+    
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
@@ -353,6 +390,68 @@ def main():
     if model.config.decoder_start_token_id is None:
         raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
 
+
+    new_datasets = {}
+    if data_args.dataset_name == 'duorc':
+        # raw_datasets["train"], raw_datasets["validation"], raw_datasets["test"] should be transformed to squad 2.0 format.
+        for split in ["train", "validation", "test"]:
+            new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": []}
+            answers = raw_datasets[split]["answers"]
+            contexts = raw_datasets[split]["plot"]
+            no_answers = raw_datasets[split]["no_answer"]
+            for i, (ans, context, imp) in tqdm.tqdm(enumerate(zip(answers, contexts, no_answers))):
+                if not imp:
+                    # answer exists
+                    # for a in ans:
+                    #     start = None
+                    #     if a in context:
+                    #         start = context.find(a) #First occurrence may not be the best occurrence.
+                    #         new_dataset['id'].append(raw_datasets[split][i]["question_id"])
+                    #         new_dataset['question'].append(raw_datasets[split][i]["question"])
+                    #         new_dataset['context'].append(raw_datasets[split][i]["plot"])
+                    #         new_dataset['title'].append(raw_datasets[split][i]["title"])
+                    #         new_dataset['answers'].append({"text": [a], 'answer_start': [start]})
+                    #         # First occurrence of an answer in context.
+                    #         break
+                    new_dataset['id'].append(raw_datasets[split][i]["question_id"])
+                    new_dataset['question'].append(raw_datasets[split][i]["question"])
+                    new_dataset['context'].append(raw_datasets[split][i]["plot"])
+                    new_dataset['title'].append(raw_datasets[split][i]["title"])
+                    new_dataset['answers'].append({"text": ans, 'answer_start': [0]*len(ans)})
+                else:
+                    # answer does not exist.
+                    new_dataset['id'].append(raw_datasets[split][i]["question_id"])
+                    new_dataset['question'].append(raw_datasets[split][i]["question"])
+                    new_dataset['context'].append(raw_datasets[split][i]["plot"])
+                    new_dataset['title'].append(raw_datasets[split][i]["title"])
+                    new_dataset['answers'].append({"text": [], 'answer_start': []})
+            # Create a new arrow dataset to replace raw_datasets.
+            new_datasets[split] = Dataset.from_dict(new_dataset)
+        raw_datasets = DatasetDict(new_datasets)
+
+    if data_args.dataset_name == 'newsqa_custom':
+        import uuid
+        new_datasets = {}
+        for split in ["train", "validation", "test"]:
+            new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": [], "story_id": []}
+            answers = raw_datasets[split]["answers"]
+            contexts = raw_datasets[split]["story_text"]
+            questions = raw_datasets[split]["question_text"]
+            for i, (question, ans, context) in tqdm.tqdm(enumerate(zip(questions, answers, contexts))):
+                new_dataset['id'].append(uuid.uuid4().hex)
+                new_dataset['question'].append(raw_datasets[split][i]["question_text"])
+                new_dataset['context'].append(raw_datasets[split][i]["story_text"])
+                new_dataset['title'].append("")
+                new_dataset['story_id'].append(raw_datasets[split][i]["storyId"])
+                if "s" in ans and "e" in ans and ans['s'] != None:
+                    answer_text = context[ans['s']:ans['e']].strip()
+                    new_dataset['answers'].append({"text": [answer_text], 'answer_start': [ans['s']]})
+                else:
+                    new_dataset['answers'].append({"text": [], 'answer_start': []})
+            # Create a new arrow dataset to replace raw_datasets.
+            new_datasets[split] = Dataset.from_dict(new_dataset)
+        raw_datasets = DatasetDict(new_datasets)
+
     # Preprocessing the datasets.
     # We need to generate and tokenize inputs and targets.
     if training_args.do_train:
@@ -360,7 +459,7 @@ def main():
     elif training_args.do_eval:
         column_names = raw_datasets["validation"].column_names
     elif training_args.do_predict:
-        column_names = raw_datasets["test"].column_names
+        column_names = raw_datasets["validation"].column_names
     else:
         logger.info("There is nothing to do. Please pass `do_train`, `do_eval` and/or `do_predict`.")
         return
@@ -409,6 +508,96 @@ def main():
         )
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
+
+    if data_args.augment_data:
+        train_dataset = raw_datasets["train"]
+        new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": []}
+        titles = train_dataset["title"]
+        answers = train_dataset["answers"]
+        contexts = train_dataset["context"]
+        questions = train_dataset["question"]
+        for i, (title, question, ans, context) in tqdm.tqdm(enumerate(zip(titles, questions, answers, contexts))):
+            if len(ans['text']):
+                # This instance has an answer. So add another with a random qiestion.
+                while(1):
+                    rand_idx = np.random.randint(len(questions))
+                    if titles[rand_idx] != titles[i]:
+                        new_question = questions[rand_idx]
+                        break
+                # Add logic such that an additional is addded only with some probability.
+                new_dataset['context'].append(context)
+                new_dataset['id'].append(train_dataset[i]["id"])
+                new_dataset['question'].append(new_question)
+                new_dataset['title'].append(title)
+                new_dataset['answers'].append({'text': [], 'answer_start': []})
+                if 'story_id' in train_dataset[i]:
+                    if 'story_id' not in new_dataset:
+                        new_dataset['story_id'] = []
+                    new_dataset['story_id'].append(train_dataset[i]["story_id"])
+            new_dataset['context'].append(context)
+            new_dataset['id'].append(train_dataset[i]["id"])
+            new_dataset['question'].append(question)
+            new_dataset['title'].append(title)
+            new_dataset['answers'].append(ans)
+            if 'story_id' in train_dataset[i]:
+                if 'story_id' not in new_dataset:
+                    new_dataset['story_id'] = []
+                new_dataset['story_id'].append(train_dataset[i]["story_id"])
+        raw_datasets["train"] = Dataset.from_dict(new_dataset)
+    
+    if data_args.question_only:
+        train_dataset = raw_datasets["train"]
+        titles = train_dataset["title"]
+        answers = train_dataset["answers"]
+        contexts = train_dataset["context"]
+        questions = train_dataset["question"]
+        np.random.shuffle(contexts)
+        c = list(zip(titles, contexts))
+        np.random.shuffle(c)
+        titles, contexts = zip(*c)
+        new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": []}
+        for i, (title, question, ans, context) in tqdm.tqdm(enumerate(zip(titles, questions, answers, contexts))):
+            if not len(ans['text']):
+                new_dataset['context'].append(context)
+            else:
+                ans_words = ans['text'][0].split()
+                context_words = context.split()
+                if len(context_words)-len(ans_words) <= 0:
+                    new_context = ans_words
+                else:
+                    random_location = np.random.randint(len(context_words)-len(ans_words))
+                    new_context = context_words[:random_location] + ans_words + context_words[random_location + len(ans_words):]
+                new_context = " ".join(new_context)
+                new_dataset['context'].append(new_context)
+            new_dataset['id'].append(train_dataset[i]["id"])
+            new_dataset['question'].append(question)
+            new_dataset['title'].append(title)
+            new_dataset['answers'].append(ans)
+            if 'story_id' in train_dataset[i]:
+                if 'story_id' not in new_dataset:
+                    new_dataset['story_id'] = []
+                new_dataset['story_id'].append(train_dataset[i]["story_id"])
+        raw_datasets["train"] = Dataset.from_dict(new_dataset)
+
+    if data_args.passage_only:
+        train_dataset = raw_datasets["train"]
+        titles = train_dataset["title"]
+        answers = train_dataset["answers"]
+        contexts = train_dataset["context"]
+        questions = train_dataset["question"]
+        new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": []}
+        for i, (title, question, ans, context) in tqdm.tqdm(enumerate(zip(titles, questions, answers, contexts))):
+            new_dataset['context'].append(context)
+            new_dataset['id'].append(train_dataset[i]["id"])
+            new_dataset['question'].append("")
+            new_dataset['title'].append(title)
+            new_dataset['answers'].append(ans)
+            if 'story_id' in train_dataset[i]:
+                if 'story_id' not in new_dataset:
+                    new_dataset['story_id'] = []
+                new_dataset['story_id'].append(train_dataset[i]["story_id"])
+        raw_datasets["train"] = Dataset.from_dict(new_dataset)
+
     def preprocess_squad_batch(
         examples,
         question_column: str,
@@ -434,6 +623,8 @@ def main():
         with tokenizer.as_target_tokenizer():
             labels = tokenizer(targets, max_length=max_answer_length, padding=padding, truncation=True)
 
+        # For longer datasets we should ideally provide that context which contains the answer.
+
         # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
         # padding in the loss.
         if padding == "max_length" and data_args.ignore_pad_token_for_loss:
@@ -456,9 +647,19 @@ def main():
             return_overflowing_tokens=True,
             return_offsets_mapping=True,
         )
-        # Setup the tokenizer for targets
+        # # Setup the tokenizer for targets
+        # with tokenizer.as_target_tokenizer():
+        #     labels = tokenizer(targets, max_length=max_answer_length, padding=padding, truncation=True)
+        
+        # Tokenize targets with the `text_target` keyword argument
         with tokenizer.as_target_tokenizer():
             labels = tokenizer(targets, max_length=max_answer_length, padding=padding, truncation=True)
+        # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore	
+        # padding in the loss.	
+        if padding == "max_length" and data_args.ignore_pad_token_for_loss:	
+            labels["input_ids"] = [	
+                [(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels["input_ids"]	
+            ]
 
         # Since one example might give us several features if it has a long context, we need a map from a feature to
         # its corresponding example. This key gives us just that.
@@ -467,20 +668,26 @@ def main():
         # For evaluation, we will need to convert our predictions to substrings of the context, so we keep the
         # corresponding example_id and we will store the offset mappings.
         model_inputs["example_id"] = []
+        # Augment the overflowing tokens to the labels	
+        labels_out = []
 
         for i in range(len(model_inputs["input_ids"])):
             # One example can give several spans, this is the index of the example containing this span of text.
             sample_index = sample_mapping[i]
             model_inputs["example_id"].append(examples["id"][sample_index])
+            labels_out.append(labels["input_ids"][sample_index])
 
         # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
         # padding in the loss.
-        if padding == "max_length" and data_args.ignore_pad_token_for_loss:
-            labels["input_ids"] = [
-                [(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels["input_ids"]
-            ]
 
-        model_inputs["labels"] = labels["input_ids"]
+        # if padding == "max_length" and data_args.ignore_pad_token_for_loss:
+        #     labels["input_ids"] = [
+        #         [(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels["input_ids"]
+        #     ]
+
+        model_inputs["labels"] = labels_out
+
+        # model_inputs["labels"] = labels["input_ids"]
         return model_inputs
 
     if training_args.do_train:
@@ -504,6 +711,106 @@ def main():
             # Number of samples might increase during Feature Creation, We select only specified max samples
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
 
+    # Define question transformation functions over huggingface datasets
+
+
+    # Previous question
+    def prev_questions(eval_dataset):
+        all_questions = [ex["question"] for ex in eval_dataset]
+        all_titles = [ex["title"] for ex in eval_dataset]
+        new_questions = []
+        for i, q in enumerate(range(1, len(all_questions))):
+            new_questions.append(all_questions[i-1])
+        new_questions.append(all_questions[0])
+        
+        eval_dataset = eval_dataset.remove_columns(["question"])
+        eval_dataset = eval_dataset.add_column("question", new_questions)
+
+        return eval_dataset
+
+    # no Question
+    def no_questions(eval_dataset):
+        # Replace question with title
+        all_questions = [ex["question"] for ex in eval_dataset]
+        all_titles = [ex["title"] for ex in eval_dataset]
+        new_questions = []
+        for i, q in enumerate(range(len(all_questions))):
+            new_questions.append(all_titles[i])
+        
+        eval_dataset = eval_dataset.remove_columns(["question"])
+        eval_dataset = eval_dataset.add_column("question", new_questions)
+        return eval_dataset
+        
+        
+    def same_para_questions(eval_dataset, seed=1234):
+        all_questions = [ex["question"] for ex in eval_dataset]
+        all_titles = [ex["title"] for ex in eval_dataset]
+        all_ids = [ex["id"] for ex in eval_dataset]
+        id_dict = {ex["id"]:ex for ex in eval_dataset}
+        
+        new_questions = []
+        new_answers = []
+        title_question_dict = {}
+        title_dict = {}
+        random.set_seed(seed)
+        for i in range(0, len(all_titles)):
+            t = all_titles[i]
+            if t in title_dict:
+                title_dict[t].append(all_ids[i])
+            else:
+                title_dict[t] = [all_ids[i]]
+        for title in title_dict:
+            ids = title_dict[title]
+            shuffled = sorted(ids, key=lambda k: random.random())
+            for id_, new_id in zip(ids, shuffled):
+                ex = id_dict[id_]
+                new_ex = id_dict[new_id]
+                new_questions.append(new_ex["question"])
+                if ex["answers"]['text'] != new_ex["answers"]['text']:
+                    new_answers.append({'text': [], 'answer_start': []})
+                else:
+                    new_answers.append(ex["answers"])
+            # swap questions with different contexts.
+            # context_dict = {}
+            # for id_ in title_dict[title]:
+            #     ex = id_dict[id_]
+            #     if ex["context"] in context_dict:
+            #         context_dict[ex["context"]].append(ex)
+            #     else:
+            #         context_dict[ex["context"]] = [ex]
+            # if len(title_dict[title]) > 1 and len(context_dict) > 1:
+            #     pdb.set_trace()
+
+        eval_dataset = eval_dataset.remove_columns(["question"])
+        eval_dataset = eval_dataset.add_column("question", new_questions)
+
+        eval_dataset = eval_dataset.remove_columns(["answers"])
+        eval_dataset = eval_dataset.add_column("answers", new_answers)
+
+        return eval_dataset
+
+    def random_questions(eval_dataset, seed=1234):
+        all_questions = [ex["question"] for ex in eval_dataset]
+        all_titles = [ex["title"] for ex in eval_dataset]
+        new_questions = []
+        new_answers = []
+        np.random.set_seed(seed)
+        for i, q in enumerate(range(0, len(all_questions))):
+            while(1):
+                rand_idx = np.random.randint(len(all_questions))
+                if all_titles[rand_idx] != all_titles[i]:
+                    new_question = all_questions[rand_idx]
+                    break
+            new_answers.append({'text': [], 'answer_start': []})
+            new_questions.append(new_question)
+        eval_dataset = eval_dataset.remove_columns(["question"])
+        eval_dataset = eval_dataset.add_column("question", new_questions)
+
+        eval_dataset = eval_dataset.remove_columns(["answers"])
+        eval_dataset = eval_dataset.add_column("answers", new_answers)
+
+        return eval_dataset
+
     if training_args.do_eval:
         if "validation" not in raw_datasets:
             raise ValueError("--do_eval requires a validation dataset")
@@ -511,6 +818,17 @@ def main():
         if data_args.max_eval_samples is not None:
             # We will select sample from whole data
             eval_examples = eval_examples.select(range(data_args.max_eval_samples))
+
+        # Partial-input perturbation
+        if data_args.partial_inputs == "no":
+            eval_examples = no_questions(eval_examples)
+        elif data_args.partial_inputs == "previous":
+            eval_examples = prev_questions(eval_examples)
+        elif data_args.partial_inputs == "random":
+            eval_examples = random_questions(eval_examples)
+        elif data_args.partial_inputs == "same_title":
+            eval_examples = same_para_questions(eval_examples)
+
         # Validation Feature Creation
         with training_args.main_process_first(desc="validation dataset map pre-processing"):
             eval_dataset = eval_examples.map(
@@ -526,13 +844,24 @@ def main():
             eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
 
     if training_args.do_predict:
-        if "test" not in raw_datasets:
+        if "validation" not in raw_datasets:
             raise ValueError("--do_predict requires a test dataset")
-        predict_examples = raw_datasets["test"]
+        predict_examples = raw_datasets["validation"]
         if data_args.max_predict_samples is not None:
             # We will select sample from whole data
             predict_examples = predict_examples.select(range(data_args.max_predict_samples))
         # Predict Feature Creation
+
+        # Partial-input perturbation
+        if data_args.partial_inputs == "no":
+            predict_examples = no_questions(predict_examples)
+        elif data_args.partial_inputs == "previous":
+            predict_examples = prev_questions(predict_examples)
+        elif data_args.partial_inputs == "random":
+            predict_examples = random_questions(predict_examples)
+        elif data_args.partial_inputs == "same_title":
+            predict_examples = same_para_questions(predict_examples)
+
         with training_args.main_process_first(desc="prediction dataset map pre-processing"):
             predict_dataset = predict_examples.map(
                 preprocess_validation_function,
@@ -558,26 +887,37 @@ def main():
     metric = load_metric("squad_v2" if data_args.version_2_with_negative else "squad")
 
     def compute_metrics(p: EvalPrediction):
-        return metric.compute(predictions=p.predictions, references=p.label_ids)
+        return metric.compute(predictions=p.predictions, references=p.label_ids, no_answer_threshold=data_args.no_answer_threshold)
 
     # Post-processing:
     def post_processing_function(
         examples: datasets.Dataset, features: datasets.Dataset, outputs: EvalLoopOutput, stage="eval"
     ):
         # Decode the predicted tokens.
-        preds = outputs.predictions
+        if type(outputs) == np.ndarray:
+            preds = outputs
+        else:
+            preds = outputs.predictions
         if isinstance(preds, tuple):
             preds = preds[0]
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
 
         # Build a map example to its corresponding features.
         example_id_to_index = {k: i for i, k in enumerate(examples["id"])}
-        feature_per_example = {example_id_to_index[feature["example_id"]]: i for i, feature in enumerate(features)}
+        # feature_per_example = {example_id_to_index[feature["example_id"]]: i for i, feature in enumerate(features)}
+        feature_per_example = {}
+        for i, feature in enumerate(features):
+            if example_id_to_index[feature["example_id"]] not in feature_per_example:
+                # The earlist feature is used.
+                feature_per_example[example_id_to_index[feature["example_id"]]] = i
         predictions = {}
         # Let's loop over all the examples!
         for example_index, example in enumerate(examples):
             # This is the index of the feature associated to the current example.
+            if example_index not in feature_per_example:
+                continue
             feature_index = feature_per_example[example_index]
+            # predictions over multiple features are getting overwritten here.
             predictions[example["id"]] = decoded_preds[feature_index]
 
         # Format the result to the format the metric expects.
@@ -589,7 +929,7 @@ def main():
             formatted_predictions = [{"id": k, "prediction_text": v} for k, v in predictions.items()]
 
         references = [{"id": ex["id"], "answers": ex[answer_column]} for ex in examples]
-        return EvalPrediction(predictions=formatted_predictions, label_ids=references)
+        return EvalPrediction(predictions=formatted_predictions, label_ids=references[:len(formatted_predictions)])
 
     # Initialize our Trainer
     trainer = QuestionAnsweringSeq2SeqTrainer(
@@ -647,7 +987,7 @@ def main():
         logger.info("*** Predict ***")
         results = trainer.predict(predict_dataset, predict_examples)
         metrics = results.metrics
-
+        
         max_predict_samples = (
             data_args.max_predict_samples if data_args.max_predict_samples is not None else len(predict_dataset)
         )
@@ -655,6 +995,15 @@ def main():
 
         trainer.log_metrics("predict", metrics)
         trainer.save_metrics("predict", metrics)
+
+        with open(os.path.join(training_args.output_dir, "predictions.jsonl"), "w") as fout:
+            predictions = results.predictions
+            for example, pred in zip(predict_examples, predictions):
+                assert example['id'] == pred['id']
+                example['prediction_text'] = pred['prediction_text']
+                example['no_answer_probability'] = pred['no_answer_probability']
+                fout.write(json.dumps(pred) + "\n")
+
 
     if training_args.push_to_hub:
         kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "question-answering"}

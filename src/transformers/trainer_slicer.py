@@ -544,7 +544,7 @@ class TrainerSlicer(Trainer):
 
                 # Adversary (which is only trained for some X number of epochs before not being used anymore)
                 # adversary warmup os for the number of epochs to train the adversary before not using it anymore.
-                if (args.adversary_warmup) == -1 or epoch < args.adversary_warmup:
+                if (args.adversary_warmup) == -1 or epoch < args.adversary_warmup: # and self.state.global_step < 3300:
                     if (
                         ((step + 1) % args.gradient_accumulation_steps != 0)
                         and args.local_rank != -1
@@ -665,6 +665,7 @@ class TrainerSlicer(Trainer):
                 self.log(model.module.get_stats(model, args))
                 model.module.reset_stats()
 
+                """
                 if self.dro_args.robust_algorithm == "GCDRO":
                     self._update_columns(epoch=epoch) #, dataloader=epoch_iterator)
                     # update epoch iterator, since instance weights are being changed in self.train_dataset
@@ -674,6 +675,7 @@ class TrainerSlicer(Trainer):
                         epoch_iterator = parallel_loader
                     else:
                         epoch_iterator = train_dataloader
+                """
             
             # End of epoch
             if step < 0:
@@ -1353,7 +1355,7 @@ class TrainerSlicer(Trainer):
                 del inputs["instance_weight"]
             loss, outputs = self.compute_loss_adversary(model, inputs, return_outputs=True)
             # Here is where GCDRO loss was computed.
-            loss = loss.mean() # This is not need.
+            loss = loss.mean() # This is not needed.
         
         if isinstance(outputs, dict):
             logits = tuple(v for k, v in outputs.items() if k not in ["loss"])

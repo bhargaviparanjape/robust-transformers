@@ -1205,6 +1205,7 @@ class TrainerDro(Trainer):
                 self.log(self.train_loss_computer.get_stats(model, args))
                 self.train_loss_computer.reset_stats()
 
+                """
                 if self.dro_args.robust_algorithm == "GCDRO":
                     self._update_columns(epoch=epoch) #, dataloader=epoch_iterator)
                     # update epoch iterator, since instance weights are being changed in self.train_dataset
@@ -1214,6 +1215,7 @@ class TrainerDro(Trainer):
                         epoch_iterator = parallel_loader
                     else:
                         epoch_iterator = train_dataloader
+                """
 
             if step < 0:
                 logger.warning(

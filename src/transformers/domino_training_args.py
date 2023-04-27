@@ -115,3 +115,9 @@ class DominoTrainingArguments(TrainingArguments):
             "help": "Turn on flag for EIIL environment inference.",
         }
     )
+    grouper_model_size: int = field(
+        default=128,
+        metadata={
+            "help": "Size of grouper model MLP.",
+        }
+    )

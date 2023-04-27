@@ -19,6 +19,7 @@ from collections.abc import Sequence
 
 import numpy as np
 import torch
+import pdb
 from packaging import version
 from torch import _softmax_backward_data, nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, LayerNorm, MSELoss
@@ -1439,7 +1440,7 @@ class DebertaV2ForTokenClassification(DebertaV2PreTrainedModel):
     DEBERTA_START_DOCSTRING,
 )
 # Copied from transformers.models.deberta.modeling_deberta.DebertaForQuestionAnswering with Deberta->DebertaV2
-class DebertaV2ForQuestionAnswering(DebertaV2PreTrainedModel):
+class DebertaV2ForQuestionAnsweringOld(DebertaV2PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
 
     def __init__(self, config):
@@ -1530,3 +1531,191 @@ class DebertaV2ForQuestionAnswering(DebertaV2PreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
+from typing import List, Optional, Tuple
+from ...file_utils import ModelOutput
+from dataclasses import dataclass
+from ...modeling_utils import (
+    PoolerAnswerClass,
+    PoolerEndLogits,
+    PoolerStartLogits)
+
+
+@dataclass
+class DebertaForQuestionAnsweringOutput(ModelOutput):
+    loss: Optional[torch.FloatTensor] = None
+    start_top_log_probs: Optional[torch.FloatTensor] = None
+    start_top_index: Optional[torch.LongTensor] = None
+    end_top_log_probs: Optional[torch.FloatTensor] = None
+    end_top_index: Optional[torch.LongTensor] = None
+    cls_logits: Optional[torch.FloatTensor] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+
+
+# Copied from transformers.models.deberta.modeling_deberta.DebertaForQuestionAnswering with Deberta->DebertaV2
+class DebertaV2ForQuestionAnswering(DebertaV2PreTrainedModel):
+    _keys_to_ignore_on_load_unexpected = [r"pooler"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.num_labels = config.num_labels
+        self.start_n_top = 5 #config.start_n_top
+        self.end_n_top = 5 #config.end_n_top
+
+        self.deberta = DebertaV2Model(config)
+        self.start_logits = PoolerStartLogits(config)
+        self.end_logits = PoolerEndLogits(config)
+        self.answer_class = PoolerAnswerClass(config)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    @add_start_docstrings_to_model_forward(DEBERTA_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        processor_class=_TOKENIZER_FOR_DOC,
+        checkpoint=_CHECKPOINT_FOR_DOC,
+        output_type=QuestionAnsweringModelOutput,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        inputs_embeds=None,
+        start_positions=None,
+        end_positions=None,
+        is_impossible=None,
+        cls_index=None,
+        p_mask=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        **kwargs,  # delete when `use_cache` is removed in XLNetModel
+    ):
+        r"""
+        start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for position (index) of the start of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
+            are not taken into account for computing the loss.
+        end_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for position (index) of the end of the labelled span for computing the token classification loss.
+            Positions are clamped to the length of the sequence (`sequence_length`). Position outside of the sequence
+            are not taken into account for computing the loss.
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        transformer_outputs = self.deberta(
+            input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            # position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        # sequence_output = outputs[0]
+
+        # logits = self.qa_outputs(sequence_output)
+        # start_logits, end_logits = logits.split(1, dim=-1)
+        # start_logits = start_logits.squeeze(-1).contiguous()
+        # end_logits = end_logits.squeeze(-1).contiguous()
+
+        hidden_states = transformer_outputs[0]
+        start_logits = self.start_logits(hidden_states, p_mask=p_mask)
+
+        # TODO: Check this.
+        outputs = transformer_outputs[1:]  # Keep mems, hidden states, attentions if there are in it
+
+        if start_positions is not None and end_positions is not None:
+            # If we are on multi-GPU, split add a dimension
+            # if len(start_positions.size()) > 1:
+            #     start_positions = start_positions.squeeze(-1)
+            # if len(end_positions.size()) > 1:
+            #     end_positions = end_positions.squeeze(-1)
+            for x in (start_positions, end_positions, cls_index, is_impossible):
+                if x is not None and x.dim() > 1:
+                    x.squeeze_(-1)
+            
+            # sometimes the start/end positions are outside our model inputs, we ignore these terms
+            # ignored_index = start_logits.size(1)
+            # start_positions = start_positions.clamp(0, ignored_index)
+            # end_positions = end_positions.clamp(0, ignored_index)
+            # during training, compute the end logits based on the ground truth of the start position
+            end_logits = self.end_logits(hidden_states, start_positions=start_positions, p_mask=p_mask)
+
+            loss_fct = CrossEntropyLoss() #ignore_index=ignored_index)
+            start_loss = loss_fct(start_logits, start_positions)
+            end_loss = loss_fct(end_logits, end_positions)
+            total_loss = (start_loss + end_loss) / 2
+
+            if cls_index is not None and is_impossible is not None:
+                # Predict answerability from the representation of CLS and START
+                cls_logits = self.answer_class(hidden_states, start_positions=start_positions, cls_index=cls_index)
+                loss_fct_cls = nn.BCEWithLogitsLoss()
+                cls_loss = loss_fct_cls(cls_logits, is_impossible)
+
+                # note(zhiliny): by default multiply the loss by 0.5 so that the scale is comparable to start_loss and end_loss
+                total_loss += cls_loss * 0.5
+
+            if not return_dict:
+                # output = (start_logits, end_logits) + outputs[1:]
+                # return ((total_loss,) + output) if total_loss is not None else output
+                return (total_loss,) + transformer_outputs[1:]
+            else:
+                return DebertaForQuestionAnsweringOutput(
+                    loss=total_loss,
+                    hidden_states=transformer_outputs.hidden_states,
+                    attentions=transformer_outputs.attentions,
+                )
+
+        else:
+            # during inference, compute the end logits based on beam search
+            bsz, slen, hsz = hidden_states.size()
+            start_log_probs = nn.functional.softmax(start_logits, dim=-1)  # shape (bsz, slen)
+
+            start_top_log_probs, start_top_index = torch.topk(
+                start_log_probs, self.start_n_top, dim=-1
+            )  # shape (bsz, start_n_top)
+            start_top_index_exp = start_top_index.unsqueeze(-1).expand(-1, -1, hsz)  # shape (bsz, start_n_top, hsz)
+            start_states = torch.gather(hidden_states, -2, start_top_index_exp)  # shape (bsz, start_n_top, hsz)
+            start_states = start_states.unsqueeze(1).expand(-1, slen, -1, -1)  # shape (bsz, slen, start_n_top, hsz)
+
+            hidden_states_expanded = hidden_states.unsqueeze(2).expand_as(
+                start_states
+            )  # shape (bsz, slen, start_n_top, hsz)
+            p_mask = p_mask.unsqueeze(-1) if p_mask is not None else None
+            end_logits = self.end_logits(hidden_states_expanded, start_states=start_states, p_mask=p_mask)
+            end_log_probs = nn.functional.softmax(end_logits, dim=1)  # shape (bsz, slen, start_n_top)
+
+            end_top_log_probs, end_top_index = torch.topk(
+                end_log_probs, self.end_n_top, dim=1
+            )  # shape (bsz, end_n_top, start_n_top)
+            end_top_log_probs = end_top_log_probs.view(-1, self.start_n_top * self.end_n_top)
+            end_top_index = end_top_index.view(-1, self.start_n_top * self.end_n_top)
+
+            start_states = torch.einsum(
+                "blh,bl->bh", hidden_states, start_log_probs
+            )  # get the representation of START as weighted sum of hidden states
+            cls_logits = self.answer_class(
+                hidden_states, start_states=start_states, cls_index=cls_index
+            )  # Shape (batch size,): one single `cls_logits` for each sample
+
+            if not return_dict:
+                outputs = (start_top_log_probs, start_top_index, end_top_log_probs, end_top_index, cls_logits)
+                return outputs + transformer_outputs[1:]
+            else:
+                return DebertaForQuestionAnsweringOutput(
+                    start_top_log_probs=start_top_log_probs,
+                    start_top_index=start_top_index,
+                    end_top_log_probs=end_top_log_probs,
+                    end_top_index=end_top_index,
+                    cls_logits=cls_logits,
+                    hidden_states=transformer_outputs.hidden_states,
+                    attentions=transformer_outputs.attentions,
+                )
