@@ -19,7 +19,8 @@ export TRANSFORMERS_CACHE=/gscratch/zlab/bparan/projects/transformers_cache
 MODEL_NAME=$3
 PARTIAL=$1
 THRESHOLD=$2
-python -m torch.distributed.launch --nproc_per_node=1 --master_port=25666  run_qa_beam_search.py \
+SEED=$4
+python -m torch.distributed.launch --nproc_per_node=2 --master_port=25666  run_qa_beam_search.py \
     --model_name_or_path /gscratch/zlab/bparan/projects/counterfactuals/models/qa_models/${MODEL_NAME} \
     --dataset_name squad_v2 \
     --do_eval \
@@ -39,3 +40,4 @@ python -m torch.distributed.launch --nproc_per_node=1 --master_port=25666  run_q
     --overwrite_cache \
     --no_answer_threshold ${THRESHOLD} \
     --partial_inputs ${PARTIAL} \
+    --partial_inputs_seed ${SEED} \

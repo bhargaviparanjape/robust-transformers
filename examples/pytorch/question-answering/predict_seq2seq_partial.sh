@@ -18,7 +18,6 @@ export TRANSFORMERS_CACHE=/gscratch/zlab/bparan/projects/transformers_cache
 MODEL_NAME=$3
 PARTIAL=$1
 THRESHOLD=$2
-SEED=$4
 python -m torch.distributed.launch --nproc_per_node=2 --master_port=25667  run_seq2seq_qa.py \
     --model_name_or_path /gscratch/zlab/bparan/projects/counterfactuals/models/qa_models/${MODEL_NAME} \
     --dataset_name squad_v2 \
@@ -34,7 +33,7 @@ python -m torch.distributed.launch --nproc_per_node=2 --master_port=25667  run_s
     --max_seq_length 384 \
     --doc_stride 128 \
     --output_dir /gscratch/zlab/bparan/projects/counterfactuals/src/t5_tmp \
-    --per_device_eval_batch_size 64 \
+    --per_device_eval_batch_size 96 \
     --per_device_train_batch_size 16 \
     --save_steps 5000 \
     --cache_dir /gscratch/zlab/bparan/projects/counterfactuals/data/QA/cache_ \
@@ -42,4 +41,4 @@ python -m torch.distributed.launch --nproc_per_node=2 --master_port=25667  run_s
     --overwrite_cache \
     --no_answer_threshold ${THRESHOLD} \
     --partial_inputs ${PARTIAL} \
-    --partial_inputs_seed ${SEED} \
+    --passage_only \

@@ -18,7 +18,8 @@ export TRANSFORMERS_CACHE=/gscratch/zlab/bparan/projects/transformers_cache
 MODEL_NAME=$3
 PARTIAL=$1
 THRESHOLD=$2
-python -m torch.distributed.launch --nproc_per_node=1 --master_port=25667  run_seq2seq_qa.py \
+SEED=$4
+python -m torch.distributed.launch --nproc_per_node=2 --master_port=27864  run_seq2seq_qa.py \
     --model_name_or_path /gscratch/zlab/bparan/projects/counterfactuals/models/qa_models/${MODEL_NAME} \
     --dataset_name newsqa_custom \
     --dataset_config newsqa_custom \
@@ -41,5 +42,6 @@ python -m torch.distributed.launch --nproc_per_node=1 --master_port=25667  run_s
     --cache_dir /gscratch/zlab/bparan/projects/counterfactuals/data/QA/cache_ \
     --report_to none \
     --overwrite_cache \
-#    --no_answer_threshold ${THRESHOLD} \
-#    --partial_inputs ${PARTIAL} \
+    --no_answer_threshold ${THRESHOLD} \
+    --partial_inputs ${PARTIAL} \
+    --partial_inputs_seed ${SEED} \

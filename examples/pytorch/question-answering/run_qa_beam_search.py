@@ -116,6 +116,9 @@ class DataTrainingArguments:
     partial_inputs: Optional[str] = field(
         default=None, metadata={"help": "which kind of partial input perturbation to make"}
     )
+    partial_inputs_seed: Optional[int] = field(
+        default=1234, metadata={"help": "random seed for perturbation"}
+    )
     question_only: Optional[bool] = field(
         default=False, metadata={"help": "Question only training"}
     )
@@ -436,60 +439,62 @@ def main():
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
     if data_args.question_only:
-        train_dataset = raw_datasets["train"]
-        titles = train_dataset["title"]
-        answers = train_dataset["answers"]
-        contexts = train_dataset["context"]
-        questions = train_dataset["question"]
-        np.random.shuffle(contexts)
-        c = list(zip(titles, contexts))
-        np.random.shuffle(c)
-        titles, contexts = zip(*c)
-        new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": []}
-        for i, (title, question, ans, context) in tqdm.tqdm(enumerate(zip(titles, questions, answers, contexts))):
-            if not len(ans['text']):
-                new_dataset['context'].append(context)
-            else:
-                ans_words = ans['text'][0].split()
-                context_words = context.split()
-                if len(context_words)-len(ans_words) <= 0:
-                    new_context = ans_words
-                    random_location = 0
+        for split_name in ["train", "validation"]:
+            dataset = raw_datasets[split_name]
+            titles = dataset["title"]
+            answers = dataset["answers"]
+            contexts = dataset["context"]
+            questions = dataset["question"]
+            np.random.shuffle(contexts)
+            c = list(zip(titles, contexts))
+            np.random.shuffle(c)
+            titles, contexts = zip(*c)
+            new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": []}
+            for i, (title, question, ans, context) in tqdm.tqdm(enumerate(zip(titles, questions, answers, contexts))):
+                if not len(ans['text']):
+                    new_dataset['context'].append(context)
                 else:
-                    random_location = np.random.randint(len(context_words)-len(ans_words))
-                    new_context = context_words[:random_location] + ans_words + context_words[random_location + len(ans_words):]
-                new_context = " ".join(new_context)
-                new_start = new_context.find(ans["text"][0])
-                ans["answer_start"] = [new_start]
-                new_dataset['context'].append(new_context)
-            new_dataset['id'].append(train_dataset[i]["id"])
-            new_dataset['question'].append(question)
-            new_dataset['title'].append(title)
-            if 'story_id' in train_dataset[i]:
-                if 'story_id' not in new_dataset:
-                    new_dataset['story_id'] = []
-                new_dataset['story_id'].append(train_dataset[i]["story_id"])
-            new_dataset['answers'].append(ans)
-        raw_datasets["train"] = Dataset.from_dict(new_dataset)
+                    ans_words = ans['text'][0].split()
+                    context_words = context.split()
+                    if len(context_words)-len(ans_words) <= 0:
+                        new_context = ans_words
+                        random_location = 0
+                    else:
+                        random_location = np.random.randint(len(context_words)-len(ans_words))
+                        new_context = context_words[:random_location] + ans_words + context_words[random_location + len(ans_words):]
+                    new_context = " ".join(new_context)
+                    new_start = new_context.find(ans["text"][0])
+                    ans["answer_start"] = [new_start]
+                    new_dataset['context'].append(new_context)
+                new_dataset['id'].append(dataset[i]["id"])
+                new_dataset['question'].append(question)
+                new_dataset['title'].append(title)
+                if 'story_id' in dataset[i]:
+                    if 'story_id' not in new_dataset:
+                        new_dataset['story_id'] = []
+                    new_dataset['story_id'].append(dataset[i]["story_id"])
+                new_dataset['answers'].append(ans)
+            raw_datasets[split_name] = Dataset.from_dict(new_dataset)
 
     if data_args.passage_only:
-        train_dataset = raw_datasets["train"]
-        titles = train_dataset["title"]
-        answers = train_dataset["answers"]
-        contexts = train_dataset["context"]
-        questions = train_dataset["question"]
-        new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": []}
-        for i, (title, question, ans, context) in tqdm.tqdm(enumerate(zip(titles, questions, answers, contexts))):
-            new_dataset['context'].append(context)
-            new_dataset['id'].append(train_dataset[i]["id"])
-            new_dataset['question'].append("")
-            new_dataset['title'].append(title)
-            if 'story_id' in train_dataset[i]:
-                if 'story_id' not in new_dataset:
-                    new_dataset['story_id'] = []
-                new_dataset['story_id'].append(train_dataset[i]["story_id"])
-            new_dataset['answers'].append(ans)
-        raw_datasets["train"] = Dataset.from_dict(new_dataset)
+        for split_name in ["train", "validation"]:
+            dataset = raw_datasets[split_name]
+            titles = dataset["title"]
+            answers = dataset["answers"]
+            contexts = dataset["context"]
+            questions = dataset["question"]
+            new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": []}
+            for i, (title, question, ans, context) in tqdm.tqdm(enumerate(zip(titles, questions, answers, contexts))):
+                new_dataset['context'].append(context)
+                new_dataset['id'].append(dataset[i]["id"])
+                new_dataset['question'].append("")
+                new_dataset['title'].append(title)
+                if 'story_id' in dataset[i]:
+                    if 'story_id' not in new_dataset:
+                        new_dataset['story_id'] = []
+                    new_dataset['story_id'].append(dataset[i]["story_id"])
+                new_dataset['answers'].append(ans)
+            raw_datasets[split_name] = Dataset.from_dict(new_dataset)
 
     # Training preprocessing
     def prepare_train_features(examples):
@@ -722,21 +727,32 @@ def main():
         all_titles = [ex["title"] for ex in eval_dataset]
         new_questions = []
         new_answers = []
+        new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": []}
         for i, q in enumerate(range(len(all_questions))):
-            new_questions.append(all_titles[i])
-            new_answers.append({'text': [], 'answer_start': []})
-        
-        eval_dataset = eval_dataset.remove_columns(["question"])
-        eval_dataset = eval_dataset.add_column("question", new_questions)
+            ex = eval_dataset[i]
+            answer_text = ex["answers"]["text"][0] if len(ex["answers"]["text"]) else ""
+            if answer_text != "":
+                new_dataset['context'].append(eval_dataset[i]["context"])
+                new_dataset['id'].append(eval_dataset[i]["id"])
+                new_dataset['question'].append(all_titles[i])
+                new_dataset['title'].append(eval_dataset[i]["title"])
+                if 'story_id' in eval_dataset[i]:
+                    if 'story_id' not in new_dataset:
+                        new_dataset['story_id'] = []
+                    new_dataset['story_id'].append(eval_dataset[i]["story_id"])
+                new_dataset['answers'].append({'text': [], 'answer_start': []})
 
-        eval_dataset = eval_dataset.remove_columns(["answers"])
-        eval_dataset = eval_dataset.add_column("answers", new_answers)
+        eval_dataset = Dataset.from_dict(new_dataset)
 
         return eval_dataset
         
-    def same_para_questions(eval_dataset):
+    def same_para_questions(eval_dataset, seed=1234):
         all_questions = [ex["question"] for ex in eval_dataset]
-        all_titles = [ex["title"] for ex in eval_dataset]
+        all_answer_texts = [ex["answers"]["text"][0] if len(ex["answers"]["text"]) else "" for ex in eval_dataset]
+        if "story_id" in eval_dataset[0]:
+            all_titles = [ex["story_id"] for ex in eval_dataset]
+        else:
+            all_titles = [ex["title"] for ex in eval_dataset]
         all_ids = [ex["id"] for ex in eval_dataset]
         id_dict = {ex["id"]:ex for ex in eval_dataset}
         
@@ -744,6 +760,8 @@ def main():
         new_answers = []
         title_question_dict = {}
         title_dict = {}
+        random.seed(seed)
+        new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": []}
         for i in range(0, len(all_titles)):
             t = all_titles[i]
             if t in title_dict:
@@ -756,11 +774,23 @@ def main():
             for id_, new_id in zip(ids, shuffled):
                 ex = id_dict[id_]
                 new_ex = id_dict[new_id]
-                new_questions.append(new_ex["question"])
-                if ex["answers"]['text'] != new_ex["answers"]['text']:
-                    new_answers.append({'text': [], 'answer_start': []})
-                else:
-                    new_answers.append(ex["answers"])
+
+                answer_text = ex["answers"]["text"][0] if len(ex["answers"]["text"]) else ""
+                if answer_text != "":
+                # This is the subset that needs to be flipped to no answer
+                    new_dataset['context'].append(ex["context"])
+                    new_dataset['id'].append(ex["id"])
+                    new_dataset['question'].append(new_ex["question"])
+                    new_dataset['title'].append(ex["title"])
+                    if 'story_id' in eval_dataset[i]:
+                        if 'story_id' not in new_dataset:
+                            new_dataset['story_id'] = []
+                        new_dataset['story_id'].append(ex["story_id"])
+                    if ex["answers"]['text'] != new_ex["answers"]['text']:
+                        new_dataset['answers'].append({'text': [], 'answer_start': []})
+                    else:
+                        new_dataset['answers'].append(ex["answers"])
+
             # swap questions with different contexts.
             # context_dict = {}
             # for id_ in title_dict[title]:
@@ -772,34 +802,50 @@ def main():
             # if len(title_dict[title]) > 1 and len(context_dict) > 1:
             #     pdb.set_trace()
 
-        eval_dataset = eval_dataset.remove_columns(["question"])
-        eval_dataset = eval_dataset.add_column("question", new_questions)
+        eval_dataset = Dataset.from_dict(new_dataset)
 
-        eval_dataset = eval_dataset.remove_columns(["answers"])
-        eval_dataset = eval_dataset.add_column("answers", new_answers)
-
-        return eval_dataset
         return eval_dataset
 
     # Random question with a different title 
-    def random_questions(eval_dataset):
+    def random_questions(eval_dataset, seed=1234):
         all_questions = [ex["question"] for ex in eval_dataset]
-        all_titles = [ex["title"] for ex in eval_dataset]
+        all_answer_texts = [ex["answers"]["text"][0] if len(ex["answers"]["text"]) else "" for ex in eval_dataset]
+        if "story_id" in eval_dataset[0]:
+            all_titles = [ex["story_id"] for ex in eval_dataset]
+        else:
+            all_titles = [ex["title"] for ex in eval_dataset]
         new_questions = []
         new_answers = []
+        np.random.seed(seed)
+        new_dataset = {'id': [], 'context':[], 'question':[], 'answers': [], "title": []}
         for i, q in enumerate(range(0, len(all_questions))):
+            answer_text = all_answer_texts[i]
             while(1):
                 rand_idx = np.random.randint(len(all_questions))
                 if all_titles[rand_idx] != all_titles[i]:
                     new_question = all_questions[rand_idx]
                     break
-            new_answers.append({'text': [], 'answer_start': []})
-            new_questions.append(new_question)
-        eval_dataset = eval_dataset.remove_columns(["question"])
-        eval_dataset = eval_dataset.add_column("question", new_questions)
+            if answer_text != "":
+                # This is the subset that needs to be flipped to no answer
+                # new_answers.append({'text': [], 'answer_start': []})
+                # new_questions.append(new_question)
 
-        eval_dataset = eval_dataset.remove_columns(["answers"])
-        eval_dataset = eval_dataset.add_column("answers", new_answers)
+                new_dataset['context'].append(eval_dataset[i]["context"])
+                new_dataset['id'].append(eval_dataset[i]["id"])
+                new_dataset['question'].append(new_question)
+                new_dataset['title'].append(eval_dataset[i]["title"])
+                if 'story_id' in eval_dataset[i]:
+                    if 'story_id' not in new_dataset:
+                        new_dataset['story_id'] = []
+                    new_dataset['story_id'].append(eval_dataset[i]["story_id"])
+                new_dataset['answers'].append({'text': [], 'answer_start': []})
+
+        # eval_dataset = eval_dataset.remove_columns(["question"])
+        # eval_dataset = eval_dataset.add_column("question", new_questions)
+
+        # eval_dataset = eval_dataset.remove_columns(["answers"])
+        # eval_dataset = eval_dataset.add_column("answers", new_answers)
+        eval_dataset = Dataset.from_dict(new_dataset)
 
         return eval_dataset
 
@@ -835,9 +881,9 @@ def main():
         elif data_args.partial_inputs == "previous":
             eval_examples = prev_questions(eval_examples)
         elif data_args.partial_inputs == "random":
-            eval_examples = random_questions(eval_examples)
+            eval_examples = random_questions(eval_examples, data_args.partial_inputs_seed)
         elif data_args.partial_inputs == "same_title":
-            eval_examples = same_para_questions(eval_examples)
+            eval_examples = same_para_questions(eval_examples, data_args.partial_inputs_seed)
 
         # eval_examples = no_questions(eval_examples)
 
